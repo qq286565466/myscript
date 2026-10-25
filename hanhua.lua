@@ -16,6 +16,16 @@
       · 动态跟随：切标签、重开面板、脚本自己改文字，都会自动补翻
       · 可逆：右上角「中/EN」按钮一键切换，原文全部缓存
 
+    ── 移动端 / Delta 兼容要点（本版本新增）──────────────
+      · GUI 父级自动降级：gethui -> get_hidden_gui -> CoreGui 写入测试 -> PlayerGui
+        （Delta 各版本对 CoreGui 的开放程度不同，逐级探测，不再硬写 CoreGui）
+      · 去掉已废弃的 Draggable，改成 UserInputService 触摸拖拽，安卓上真能拖
+      · 扫描分帧执行（每帧约 12ms 预算），不会阻塞主线程、不会超时/掉帧
+      · 判定结果带 TTL 缓存 + 已确认实例标记，重扫成本从 O(n²) 降到近 O(n)
+      · 兜底重扫自适应降频（后面越来越慢、最后自动停止），手机省电
+      · LocalPlayer 未就绪时异步等待，不在加载界面报错
+      · 字体 / 属性写入全部 pcall 保护，某个属性被锁也不会中断整个脚本
+
     用法：
       执行即可。运行后：
         getgenv().UIT_CN.restore()      还原英文
@@ -23,6 +33,7 @@
         getgenv().UIT_CN.rescan()       立即重新扫描
         getgenv().UIT_CN.addPairs({ {"Auto Fish","自动钓鱼"} })  追加词条
         getgenv().UIT_CN.stop()         停止并移除按钮
+        getgenv().UIT_CN.parent()       查看当前 GUI 挂载到了哪（调试用）
 
     想加自己的翻译：往 EXACT_PAIRS 里加 { "English", "中文" } 即可，
     单词会进单词表，多词会进短语表（大小写不敏感）。
@@ -34,16 +45,126 @@ local CONFIG = {
     showToggle       = true,   -- 显示浮动「中/EN」按钮
     translatePlayerGui = false, -- true = 连游戏本身 HUD 一起翻
     watchNewUI       = true,   -- 监听后续新建 / 重建的界面
-    rescanSeconds    = 300,    -- 兜底重扫持续时间（秒）
-    rescanInterval   = 1.5,    -- 兜底重扫间隔（秒）
+    rescanSeconds    = 180,    -- 兜底重扫持续时间（秒）；手机别太长
+    rescanInterval   = 1.5,    -- 兜底重扫间隔（秒），会自适应变慢
+    rescanMaxGap     = 6,      -- 兜底重扫间隔上限（秒）
     minTextsForMenu  = 24,     -- 判定菜单：GUI 内文本元素下限
     minMenuScore     = 3,      -- 判定菜单：命中菜单特征词的数量下限
+    bigTextsForMenu  = 80,     -- 文本多到一定程度直接判为菜单（不做严格模式）
     strictNoMixed    = true,   -- 严格模式：译文里还有没翻掉的英文词就整条保留原文（不出半中半英）
     maxLeftRatio     = 0.4,    -- 兼容旧配置，留作参考
     includeNames     = {},     -- 强制纳入的 GUI 名（小写子串），如 { "hub", "menu" }
     extraExclude     = {},     -- 额外排除的 GUI 名（小写）
     verbose          = true,
+
+    -- ===== 移动端 / 执行器兼容参数 =====
+    frameBudget      = 0.012,  -- 单帧扫描时间预算（秒），越小越不卡
+    cacheSeconds     = 3,      -- GUI 判定结果缓存时间（秒），过期才重新判定
+    usePlayerGuiFallback = true, -- 隐藏容器里一个菜单都没找到时，退一步扫 PlayerGui
+    toggleSize       = nil,    -- 手动指定按钮尺寸 {w, h}，nil = 触屏自动放大
 }
+
+----------------------------------------------------------------
+-- 0. 执行器兼容层（Delta / Android 优先）
+----------------------------------------------------------------
+-- 说明：不同执行器暴露的全局函数、可写入的 GUI 父级都不同。
+--       这里全部走探测 + pcall，任何一步失败都只是降级，不会中断脚本。
+
+local ENV = (type(getgenv) == "function" and getgenv()) or _G
+local PlayersSvc = game:GetService("Players")
+local UserInput
+pcall(function() UserInput = game:GetService("UserInputService") end)
+
+local function safeGet(fn, default)
+    local ok, v = pcall(fn)
+    if ok and v ~= nil then return v end
+    return default
+end
+
+local function isInst(v)
+    local ok, r = pcall(function() return typeof(v) == "Instance" end)
+    return ok and r == true
+end
+
+-- 等待 LocalPlayer 就绪（Delta 在加载界面注入时可能为 nil）
+-- 带缓存 + 失败退避，避免每次重扫都白等 3 秒
+local playerCache, playerFailAt = nil, nil
+
+local function getLocalPlayer(timeout)
+    if isInst(playerCache) and playerCache.Parent then return playerCache end
+    local p = PlayersSvc.LocalPlayer
+    if p then playerCache = p; return p end
+    if playerFailAt and (os.clock() - playerFailAt) < 15 then return nil end
+
+    local t0 = os.clock()
+    local limit = timeout or 3
+    while os.clock() - t0 < limit do
+        task.wait(0.2)
+        p = PlayersSvc.LocalPlayer
+        if p then playerCache = p; return p end
+    end
+    playerFailAt = os.clock()
+    return nil
+end
+
+local function getPlayerGui()
+    local plr = getLocalPlayer(3)
+    if not plr then return nil end
+    local pg = safeGet(function() return plr:FindFirstChildOfClass("PlayerGui") end)
+    if pg then return pg end
+    return safeGet(function() return plr:WaitForChild("PlayerGui", 5) end)
+end
+
+-- 隐藏 GUI 容器：依次尝试各家执行器的接口
+local GUI_PARENT_NAME = "未挂载"
+
+local function tryHiddenRoot()
+    local names = { "gethui", "get_hidden_gui", "getHiddenGui", "gethiddenui" }
+    for _, n in ipairs(names) do
+        local f = ENV[n] or rawget(_G, n)
+        if type(f) == "function" then
+            local ok, h = pcall(f)
+            if ok and isInst(h) then
+                GUI_PARENT_NAME = n .. "()"
+                return h
+            end
+        end
+    end
+    return nil
+end
+
+local function probeParent(parent)
+    if not isInst(parent) then return false end
+    local probe = Instance.new("ScreenGui")
+    probe.Name = "UIT_CN_Probe"
+    probe.ResetOnSpawn = false
+    local ok = pcall(function() probe.Parent = parent end)
+    local ok2 = ok and safeGet(function() return probe.Parent == parent end, false)
+    pcall(function() probe:Destroy() end)
+    return ok2 == true
+end
+
+-- 解析可用父级：gethui -> get_hidden_gui -> CoreGui(探测写入) -> PlayerGui
+local function resolveGuiParent()
+    local h = tryHiddenRoot()
+    if h then return h end
+
+    local cg = safeGet(function() return game:GetService("CoreGui") end)
+    if cg and probeParent(cg) then
+        GUI_PARENT_NAME = "CoreGui"
+        return cg
+    end
+
+    local pg = getPlayerGui()
+    if pg then
+        GUI_PARENT_NAME = "PlayerGui"
+        return pg
+    end
+
+    GUI_PARENT_NAME = "无可用父级"
+    return nil
+end
+
 
 ----------------------------------------------------------------
 -- 1. 词库：通用界面 / 功能 / 设置术语
@@ -907,19 +1028,26 @@ end
 ----------------------------------------------------------------
 -- 5. 应用到实例
 ----------------------------------------------------------------
+-- 用 ClassName 判定（移动端受限容器里 IsA 可能抛错，这里全程 pcall 兜住）
+local TEXT_CLASS = { TextLabel = true, TextButton = true, TextBox = true }
+
 local function isText(o)
-    return o:IsA("TextLabel") or o:IsA("TextButton") or o:IsA("TextBox")
+    local ok, cn = pcall(function() return o.ClassName end)
+    return (ok and TEXT_CLASS[cn]) or false
 end
 
 local state = {
-    enabled   = true,
-    running   = false,
-    originals = setmetatable({}, { __mode = "k" }),
-    hooked    = setmetatable({}, { __mode = "k" }),
-    busy      = setmetatable({}, { __mode = "k" }),
-    conns     = {},
-    count     = 0,
-    guis      = 0,
+    enabled     = true,
+    running     = false,
+    originals   = setmetatable({}, { __mode = "k" }),
+    phOriginals = setmetatable({}, { __mode = "k" }),
+    hooked      = setmetatable({}, { __mode = "k" }),
+    confirmed   = setmetatable({}, { __mode = "k" }),  -- 已确认属于目标菜单的文本元素
+    busy        = setmetatable({}, { __mode = "k" }),
+    conns       = {},
+    count       = 0,
+    guis        = 0,
+    usePlayerGui = false,   -- 是否已进入 PlayerGui 兜底模式（重新启用时要沿用）
 }
 
 local translateObj
@@ -927,17 +1055,23 @@ local translateObj
 local function watchObj(o)
     if state.hooked[o] then return end
     state.hooked[o] = true
-    local c = o:GetPropertyChangedSignal("Text"):Connect(function()
-        if state.enabled and state.running and not state.busy[o] then
-            task.defer(translateObj, o)
-        end
+    local ok, c = pcall(function()
+        return o:GetPropertyChangedSignal("Text"):Connect(function()
+            if state.enabled and state.running and not state.busy[o] then
+                task.defer(translateObj, o)
+            end
+        end)
     end)
-    table.insert(state.conns, c)
+    if ok and c then table.insert(state.conns, c) else state.hooked[o] = nil end
 end
 
-translateObj = function(o)
-    if not state.enabled or not isText(o) then return end
-    if state.busy[o] or o:GetAttribute("UIT_SELF") then return end
+-- 真正的写属性逻辑（外层 pcall 包裹，任何属性被锁都不影响其它元素）
+local function applyTo(o)
+    if not state.enabled or not isText(o) then return 0 end
+    if state.busy[o] then return 0 end
+    if o:GetAttribute("UIT_SELF") then return 0 end
+
+    local changed = 0
 
     local raw = o.Text
     if type(raw) == "string" and raw ~= "" then
@@ -945,34 +1079,46 @@ translateObj = function(o)
         if new and new ~= raw then
             state.originals[o] = raw
             state.busy[o] = true
-            o.Text = new
+            local ok = pcall(function() o.Text = new end)
             state.busy[o] = nil
-            state.count += 1
-            watchObj(o)
-        end
-    end
-
-    if o:IsA("TextBox") then
-        local ph = o.PlaceholderText
-        if type(ph) == "string" and ph ~= "" then
-            local newph = translate(ph)
-            if newph and newph ~= ph then
-                state.busy[o] = true
-                o.PlaceholderText = newph
-                state.busy[o] = nil
+            if ok then
+                changed = 1
+                state.count += 1
             end
         end
     end
+
+    if o.ClassName == "TextBox" then
+        local ph = o.PlaceholderText
+        if type(ph) == "string" and ph ~= "" and not state.phOriginals[o] then
+            local newph = translate(ph)
+            if newph and newph ~= ph then
+                state.phOriginals[o] = ph
+                pcall(function() o.PlaceholderText = newph end)
+            end
+        end
+    end
+    return changed
+end
+
+translateObj = function(o)
+    local ok, n = pcall(applyTo, o)
+    if ok then return n or 0 end
+    return 0
 end
 
 local function restoreAll()
     local n = 0
     for inst, txt in pairs(state.originals) do
-        if inst and inst.Parent then
+        if isInst(inst) and inst.Parent then
             state.busy[inst] = true
-            pcall(function() inst.Text = txt end)
+            if pcall(function() inst.Text = txt end) then n += 1 end
             state.busy[inst] = nil
-            n += 1
+        end
+    end
+    for inst, txt in pairs(state.phOriginals) do
+        if isInst(inst) and inst.Parent then
+            pcall(function() inst.PlaceholderText = txt end)
         end
     end
     state.count = 0
@@ -1020,33 +1166,36 @@ local MARKERS = {
     luck = true, cooldown = true, upgrade = true, shop = true, quest = true,
 }
 
-local guiCache = setmetatable({}, { __mode = "k" })
+local guiCache = setmetatable({}, { __mode = "k" })  -- [gui] = { ok = bool, t = clock }
+local targetCount = 0
 
-local function textCount(gui)
+local function countTargets()
     local n = 0
-    local ok = pcall(function()
-        for _, d in ipairs(gui:GetDescendants()) do
-            if isText(d) then n += 1 end
-        end
-    end)
-    return ok and n or 0
+    for _, e in pairs(guiCache) do if e.ok then n += 1 end end
+    return n
 end
 
-local function menuScore(gui)
-    local score, seen = 0, {}
+-- 一次遍历同时取「文本量」和「菜单特征词命中数」（原来遍历两遍，手机上白白多一倍开销）
+local function analyze(gui)
+    local count, score = 0, 0
+    local seen = {}
     pcall(function()
         for _, d in ipairs(gui:GetDescendants()) do
             if isText(d) then
-                for w in tostring(d.Text):lower():gmatch("[%a]+") do
-                    if MARKERS[w] and not seen[w] then
-                        seen[w] = true
-                        score += 1
+                count += 1
+                local t = d.Text
+                if type(t) == "string" then
+                    for w in t:lower():gmatch("[%a]+") do
+                        if MARKERS[w] and not seen[w] then
+                            seen[w] = true
+                            score += 1
+                        end
                     end
                 end
             end
         end
     end)
-    return score
+    return count, score
 end
 
 local function nameExcluded(name)
@@ -1067,224 +1216,415 @@ local function nameIncluded(name)
 end
 
 -- 判断某个 GUI（容器下的一级子项）是否为目标菜单
-local function isTarget(gui)
-    if not gui or not gui.Parent then return false end
-    if gui:GetAttribute("UIT_SELF") then return false end
+-- strict = true：必须是「文本量够 + 命中菜单特征词」双条件（PlayerGui 兜底时用，防误翻游戏 HUD）
+local function isTarget(gui, strict)
+    if not isInst(gui) then return false end
+    if not safeGet(function() return gui.Parent ~= nil end, false) then return false end
+
     local cached = guiCache[gui]
-    if cached ~= nil then return cached end
+    if cached and (os.clock() - cached.t) < CONFIG.cacheSeconds then
+        return cached.ok
+    end
 
     local ok, res = pcall(function()
-        if nameExcluded(gui.Name) then return false end
-        if nameIncluded(gui.Name) then
-            if textCount(gui) >= 3 then return true end
-        end
-        local tc = textCount(gui)
+        local name = gui.Name
+        if nameExcluded(name) then return false end
+        if gui:GetAttribute("UIT_SELF") then return false end
+
+        local tc, sc = analyze(gui)
+        if nameIncluded(name) and tc >= 3 then return true end
         if tc < CONFIG.minTextsForMenu then return false end
-        -- 文本量很大且不是 Roblox 自带界面，基本可以确定是脚本菜单
-        if tc >= 80 then return true end
-        return menuScore(gui) >= CONFIG.minMenuScore
+        if strict then return sc >= CONFIG.minMenuScore end
+        if tc >= CONFIG.bigTextsForMenu then return true end
+        return sc >= CONFIG.minMenuScore
     end)
-    res = ok and res or false
-    if res then
-        guiCache[gui] = true
-        state.guis += 1
+    res = (ok and res) == true
+
+    if res and not (cached and cached.ok) then
+        targetCount += 1
+        state.guis = targetCount
     end
+    guiCache[gui] = { ok = res, t = os.clock() }
     return res
 end
 
-local function containerList()
-    local list = {}
-    local add = function(v)
-        if typeof(v) == "Instance" then
-            for _, x in ipairs(list) do if x == v then return end end
-            table.insert(list, v)
+-- 容器列表：探测到哪个用哪个，参数 includePlayerGui 强制把 PlayerGui 也纳入
+local function containerList(includePlayerGui)
+    local list, seen = {}, {}
+    local function add(v)
+        if isInst(v) and not seen[v] then
+            seen[v] = true
+            list[#list + 1] = v
         end
     end
-    pcall(function() add(gethui and gethui()) end)
-    pcall(function() add(get_hidden_gui and get_hidden_gui()) end)
-    pcall(function() add(game:GetService("CoreGui")) end)
-    if CONFIG.translatePlayerGui then
-        pcall(function()
-            local plr = game:GetService("Players").LocalPlayer
-            add(plr and plr:FindFirstChildOfClass("PlayerGui"))
-        end)
+    add(tryHiddenRoot())
+    add(safeGet(function() return game:GetService("CoreGui") end))
+    if includePlayerGui or CONFIG.translatePlayerGui then
+        add(getPlayerGui())
     end
     return list
 end
 
 -- 沿祖先链找最近的「菜单级」GUI
--- 只认 ScreenGui（脚本菜单基本都是 ScreenGui），Name 显式指定的容器才放宽
-local function targetAncestor(o)
+-- 只认 ScreenGui（脚本菜单基本都是 ScreenGui），Name 显式指定的容器才放宽；
+-- BillboardGui / SurfaceGui 属于游戏内 3D UI，一律不碰
+local function targetAncestor(o, strict)
     local ok, res = pcall(function()
         local p = o.Parent
-        while p do
-            if guiCache[p] then return p end
-            if p:IsA("ScreenGui") then
-                if isTarget(p) then return p end
+        local depth = 0
+        while p and depth < 40 do
+            local c = guiCache[p]
+            if c and c.ok then return p end
+            local cn = p.ClassName
+            if cn == "ScreenGui" then
+                if isTarget(p, strict) then return p end
+            elseif cn == "BillboardGui" or cn == "SurfaceGui" then
+                return nil
             elseif nameIncluded(p.Name) then
-                guiCache[p] = true
-                state.guis += 1
+                guiCache[p] = { ok = true, t = os.clock() }
+                targetCount += 1
+                state.guis = targetCount
                 return p
             end
             p = p.Parent
+            depth += 1
         end
         return nil
     end)
-    if ok then return res end
-    return nil
+    return (ok and res) or nil
 end
 
-local function sweepContainer(c)
+-- 分帧扫描：每处理一小批就把控制权还给引擎，手机上不卡、也不会被判定脚本超时
+local function sweepContainer(c, strict)
+    if not isInst(c) then return 0 end
     local ok, desc = pcall(function() return c:GetDescendants() end)
-    if not ok then return 0 end
-    local n = 0
-    for _, d in ipairs(desc) do
-        if isText(d) then
-            local okA, tgt = pcall(targetAncestor, d)
-            if okA and tgt then
-                local before = state.count
-                pcall(watchObj, d)
-                pcall(translateObj, d)
-                if state.count > before then n += 1 end
+    if not ok or type(desc) ~= "table" then return 0 end
+
+    local n, t0 = 0, os.clock()
+    for i = 1, #desc do
+        if (os.clock() - t0) >= CONFIG.frameBudget then
+            task.wait()
+            t0 = os.clock()
+            if not state.running then return n end
+        end
+
+        local d = desc[i]
+        if state.confirmed[d] then
+            n += translateObj(d)
+        elseif isText(d) then
+            local tgt = targetAncestor(d, strict)
+            if tgt then
+                state.confirmed[d] = true
+                watchObj(d)
+                n += translateObj(d)
             end
         end
     end
     return n
 end
 
-local function sweepAll()
-    local n = 0
-    for _, c in ipairs(containerList()) do
-        local ok, r = pcall(sweepContainer, c)
-        if ok then n += r end
+local function sweepAll(includePlayerGui, strict)
+    local total = 0
+    local list = containerList(includePlayerGui)
+    local pg = nil
+    if includePlayerGui or CONFIG.translatePlayerGui then pg = getPlayerGui() end
+    for _, c in ipairs(list) do
+        -- 只有「兜底扫 PlayerGui」时才强制严格判定；
+        -- 用户主动把 translatePlayerGui 打开 = 想连游戏 HUD 一起翻，就不加严格限制
+        local s = (strict == true) or ((pg ~= nil and c == pg) and not CONFIG.translatePlayerGui)
+        local ok, r = pcall(sweepContainer, c, s)
+        if ok then total += r end
     end
-    return n
+    return total
 end
 
 ----------------------------------------------------------------
--- 7. 「中 / EN」浮动按钮
+-- 7. 「中 / EN」浮动按钮（触屏拖拽版）
 ----------------------------------------------------------------
-local toggleGui, toggleBtn
+local toggleGui, toggleBtn = nil, nil
+local toggleTries = 0
+local setEnabled
+
+local function refreshToggleText()
+    if toggleBtn then
+        pcall(function() toggleBtn.Text = state.enabled and "中" or "EN" end)
+    end
+end
 
 local function buildToggle()
     if not CONFIG.showToggle or toggleGui then return end
-    local parent
-    pcall(function() parent = gethui and gethui() end)
-    if not parent then pcall(function() parent = game:GetService("CoreGui") end) end
-    if not parent then return end
+    if toggleTries >= 8 then return end          -- 探测失败不要无限重试
 
-    toggleGui = Instance.new("ScreenGui")
-    toggleGui.Name = "UIT_CN_Toggle"
-    toggleGui.ResetOnSpawn = false
-    toggleGui.IgnoreGuiInset = true
-    toggleGui.DisplayOrder = 999999
-    toggleGui:SetAttribute("UIT_SELF", true)
+    local parent = resolveGuiParent()
+    if not parent then
+        toggleTries += 1
+        task.delay(2, function()
+            if state.running then buildToggle() end
+        end)
+        return
+    end
+    toggleTries += 1
 
-    toggleBtn = Instance.new("TextButton")
-    toggleBtn.Name = "Toggle"
-    toggleBtn:SetAttribute("UIT_SELF", true)
-    toggleBtn.Size = UDim2.fromOffset(44, 28)
-    toggleBtn.Position = UDim2.new(1, -60, 0, 160)
-    toggleBtn.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
-    toggleBtn.BackgroundTransparency = 0.05
-    toggleBtn.TextColor3 = Color3.fromRGB(240, 240, 240)
-    toggleBtn.TextSize = 14
-    toggleBtn.Font = Enum.Font.GothamBold
-    toggleBtn.Text = "中"
-    toggleBtn.AutoButtonColor = true
-    toggleBtn.Draggable = true
-    toggleBtn.Parent = toggleGui
+    local ok, err = pcall(function()
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "UIT_CN_Toggle"
+        gui.ResetOnSpawn = false
+        gui.IgnoreGuiInset = true
+        gui.DisplayOrder = 999999
+        gui:SetAttribute("UIT_SELF", true)
 
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 6)
-    corner.Parent = toggleBtn
+        local btn = Instance.new("TextButton")
+        btn.Name = "Toggle"
+        btn:SetAttribute("UIT_SELF", true)
 
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.fromRGB(72, 72, 80)
-    stroke.Thickness = 1
-    stroke.Parent = toggleBtn
+        -- 触屏手指需要更大的点击区域
+        local w, h = 44, 28
+        if CONFIG.toggleSize then
+            w = CONFIG.toggleSize[1] or w
+            h = CONFIG.toggleSize[2] or h
+        elseif UserInput and UserInput.TouchEnabled then
+            w, h = 56, 36
+        end
 
-    toggleBtn.MouseButton1Click:Connect(function()
-        state.enabled = not state.enabled
-        toggleBtn.Text = state.enabled and "中" or "EN"
-        if state.enabled then sweepAll() else restoreAll() end
+        btn.Size = UDim2.fromOffset(w, h)
+        btn.Position = UDim2.new(1, -(w + 14), 0, 96)
+        btn.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+        btn.BackgroundTransparency = 0.05
+        btn.TextColor3 = Color3.fromRGB(240, 240, 240)
+        btn.TextSize = 15
+        btn.Text = state.enabled and "中" or "EN"
+        btn.AutoButtonColor = true
+        btn.Active = true
+        pcall(function() btn.Font = Enum.Font.GothamBold end)
+        btn.Parent = gui
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 6)
+        corner.Parent = btn
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = Color3.fromRGB(72, 72, 80)
+        stroke.Thickness = 1
+        stroke.Parent = btn
+
+        -- ---- 触摸 / 鼠标拖拽（Draggable 已废弃，安卓上根本拖不动，改手动实现）----
+        local dragging, dragStart, startPos, moved = false, nil, nil, false
+
+        btn.InputBegan:Connect(function(input)
+            local t = input.UserInputType
+            if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+                dragging, moved = true, false
+                dragStart = input.Position
+                startPos = btn.Position
+            end
+        end)
+
+        if UserInput then
+            table.insert(state.conns, UserInput.InputChanged:Connect(function(input)
+                if not dragging or not dragStart then return end
+                local t = input.UserInputType
+                if t ~= Enum.UserInputType.MouseMovement and t ~= Enum.UserInputType.Touch then return end
+                local delta = input.Position - dragStart
+                if math.abs(delta.X) > 6 or math.abs(delta.Y) > 6 then moved = true end
+                btn.Position = UDim2.new(
+                    startPos.X.Scale, startPos.X.Offset + delta.X,
+                    startPos.Y.Scale, startPos.Y.Offset + delta.Y
+                )
+            end))
+
+            table.insert(state.conns, UserInput.InputEnded:Connect(function(input)
+                local t = input.UserInputType
+                if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+                    if dragging then
+                        dragging = false
+                        -- 拖完立刻抬手会误触点击，延迟清标志
+                        if moved then task.delay(0.25, function() moved = false end) end
+                    end
+                end
+            end))
+        end
+
+        btn.MouseButton1Click:Connect(function()
+            if moved then return end
+            setEnabled(not state.enabled)
+        end)
+
+        gui.Parent = parent
+        toggleGui, toggleBtn = gui, btn
     end)
 
-    toggleGui.Parent = parent
+    if not ok then
+        warn("[UIT-CN] 按钮创建失败: " .. tostring(err))
+    end
 end
 
-local function setEnabled(on)
+setEnabled = function(on)
     state.enabled = on
-    if toggleBtn then toggleBtn.Text = on and "中" or "EN" end
-    if on then sweepAll() else restoreAll() end
+    refreshToggleText()
+    if on then
+        if state.usePlayerGui then sweepAll(true, true) else sweepAll(false) end
+    else
+        restoreAll()
+    end
 end
 
 ----------------------------------------------------------------
 -- 8. 启动 / 停止 / 对外接口
 ----------------------------------------------------------------
+-- 新建元素队列：DescendantAdded 在界面构建时会疯狂触发，
+-- 手机上必须合并成批处理，否则一开菜单就掉帧
+local newQueue, flushQueued = {}, false
+
+local function flushNewQueue()
+    flushQueued = false
+    if not state.running or not state.enabled then
+        newQueue = {}
+        return
+    end
+    local batch = newQueue
+    newQueue = {}
+    local t0 = os.clock()
+    for i = 1, #batch do
+        if (os.clock() - t0) >= CONFIG.frameBudget then
+            task.wait()
+            t0 = os.clock()
+            if not state.running then return end
+        end
+        local d, strict = batch[i][1], batch[i][2]
+        if isInst(d) and isText(d) then
+            if state.confirmed[d] then
+                translateObj(d)
+            else
+                local tgt = targetAncestor(d, strict)
+                if tgt then
+                    state.confirmed[d] = true
+                    watchObj(d)
+                    translateObj(d)
+                end
+            end
+        end
+    end
+end
+
+local function scheduleFlush()
+    if flushQueued then return end
+    flushQueued = true
+    task.delay(0.15, flushNewQueue)
+end
+
+local function hookNewUI(container, strict)
+    if not isInst(container) then return end
+    local ok, conn = pcall(function()
+        return container.DescendantAdded:Connect(function(d)
+            if not state.running or not state.enabled then return end
+            if #newQueue >= 3000 then return end          -- 极端情况直接丢弃，交给兜底重扫
+            if not isText(d) then return end
+            newQueue[#newQueue + 1] = { d, strict }
+            scheduleFlush()
+        end)
+    end)
+    if ok and conn then table.insert(state.conns, conn) end
+end
+
 local function start()
     buildToggle()
-    sweepAll()
 
+    -- 1) 先扫隐藏容器（gethui / CoreGui）
+    local ok1, r1 = pcall(sweepAll, false)
+    if not ok1 and CONFIG.verbose then
+        warn("[UIT-CN] 主容器扫描异常: " .. tostring(r1))
+    end
+
+    -- 2) 一个菜单都没认出来 -> 退一步扫 PlayerGui（严格判定，绝不误翻游戏 HUD）
+    local usedPlayerGui = false
+    if CONFIG.usePlayerGuiFallback and countTargets() == 0 then
+        local pg = getPlayerGui()
+        if pg then
+            usedPlayerGui = true
+            if CONFIG.verbose then
+                print("[UIT-CN] 隐藏容器内未发现菜单，已切换到 PlayerGui 严格扫描")
+            end
+            pcall(sweepContainer, pg, true)
+        end
+    end
+    state.usePlayerGui = usedPlayerGui
+
+    -- 3) 监听后续新建 / 重建的界面
     if CONFIG.watchNewUI then
-        for _, c in ipairs(containerList()) do
-            local okConn, conn = pcall(function()
-                return c.DescendantAdded:Connect(function(d)
-                    if not state.enabled or not state.running then return end
-                    task.defer(function()
-                        if not state.enabled or not state.running then return end
-                        if isText(d) then
-                            local okA, tgt = pcall(targetAncestor, d)
-                            if okA and tgt then
-                                pcall(watchObj, d)
-                                translateObj(d)
-                            end
-                        end
-                    end)
-                end)
-            end)
-            if okConn then table.insert(state.conns, conn) end
+        local list = containerList(usedPlayerGui)
+        local pg = (usedPlayerGui or CONFIG.translatePlayerGui) and getPlayerGui() or nil
+        for _, c in ipairs(list) do
+            local strictPg = (pg ~= nil and c == pg) and not CONFIG.translatePlayerGui
+            hookNewUI(c, strictPg)
         end
     end
 
+    -- 4) 兜底重扫：自适应降频，手机上不会一直烧 CPU
     task.spawn(function()
         local t0 = os.clock()
+        local gap = CONFIG.rescanInterval
+        local idle = 0
         while state.running and (os.clock() - t0) < CONFIG.rescanSeconds do
-            task.wait(CONFIG.rescanInterval)
-            if state.enabled and state.running then pcall(sweepAll) end
+            task.wait(gap)
+            if not state.running then break end
+            if state.enabled then
+                local before = state.count
+                pcall(sweepAll, usedPlayerGui, usedPlayerGui)
+                if state.count == before then
+                    idle += 1
+                    if idle >= 2 then
+                        gap = math.min(gap * 1.4, CONFIG.rescanMaxGap)
+                        idle = 0
+                    end
+                else
+                    idle = 0
+                    gap = CONFIG.rescanInterval
+                end
+            end
         end
     end)
 
     if CONFIG.verbose then
-        local hubs = 0
-        for _ in pairs(guiCache) do hubs += 1 end
+        local hubs = countTargets()
         if hubs > 0 then
-            print(("[UIT-CN] 已识别 %d 个界面，本次翻译 %d 个文本元素"):format(hubs, state.count))
+            print(("[UIT-CN] 已识别 %d 个界面，本次翻译 %d 个文本元素（挂载: %s）")
+                :format(hubs, state.count, GUI_PARENT_NAME))
         else
-            print("[UIT-CN] 暂未发现脚本菜单，已进入监听：菜单打开后会自动翻译")
+            print(("[UIT-CN] 暂未发现脚本菜单，已进入监听：菜单打开后会自动翻译（挂载: %s）")
+                :format(GUI_PARENT_NAME))
         end
     end
 end
 
 local api = {}
+api.version = "2.0-mobile"
 api.translate = translate
 api.addPairs = addPairs
 api.enable = function() setEnabled(true) end
 api.disable = function() setEnabled(false) end
 api.restore = function() return restoreAll() end
-api.rescan = function() return sweepAll() end
-api.stats = function() return state.count, state.guis, state.enabled end
+api.rescan = function()
+    local n = sweepAll(state.usePlayerGui, state.usePlayerGui)
+    if n == 0 and not state.usePlayerGui and CONFIG.usePlayerGuiFallback and countTargets() == 0 then
+        local pg = getPlayerGui()
+        if pg then pcall(sweepContainer, pg, true) end
+    end
+    return state.count
+end
+api.stats = function() return state.count, countTargets(), state.enabled end
+api.parent = function() return GUI_PARENT_NAME end
 api.stop = function()
     state.running = false
     for _, c in ipairs(state.conns) do pcall(function() c:Disconnect() end) end
     state.conns = {}
+    newQueue, flushQueued = {}, false
     if toggleGui then pcall(function() toggleGui:Destroy() end) end
     toggleGui, toggleBtn = nil, nil
 end
 
-local prev = getgenv().UIT_CN
+local prev = ENV.UIT_CN
 if type(prev) == "table" and type(prev.stop) == "function" then pcall(prev.stop) end
-getgenv().UIT_CN = api
+ENV.UIT_CN = api
 
 state.running = true
 if CONFIG.autoApply then
