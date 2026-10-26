@@ -65,11 +65,11 @@ local CONFIG = {
     -- 没命中就排队调用在线接口，结果写进缓存并立即应用到界面上。
     autoTranslate   = true,
     apiProvider     = "auto",   -- auto | google | mymemory | youdao
-    apiBatch        = 4,        -- 每批同时处理几条
-    apiInterval     = 0.25,     -- 每批之间的间隔（秒），别调太小以免被限流
+    apiBatch        = 12,       -- 每批处理几条（google 支持换行合并，一次请求翻一批）
+    apiInterval     = 0.12,     -- 每批之间的间隔（秒）
     apiTimeoutMs    = 8000,
     apiRetries      = 1,
-    maxQueue        = 300,      -- 待翻译队列上限，防止一次塞爆
+    maxQueue        = 600,      -- 待翻译队列上限
     maxTextLen      = 160,      -- 超过这个长度的不进自动翻译（长句机翻很烂）
     skipPlayerNames = true,     -- 跳过玩家名，不翻成人名乱码
 
@@ -230,6 +230,7 @@ local EXACT_PAIRS = {
 
     -- 玩家 / 战斗 / 数值
     { "Player", "玩家" }, { "Players", "玩家" }, { "Team", "队伍" }, { "Health", "生命" },
+    { "Target", "目标" }, { "Targets", "目标" }, { "Self", "自身" }, { "Friend", "好友" },
     { "Damage", "伤害" }, { "Status", "状态" }, { "Online", "在线" }, { "Ping", "延迟" },
     { "Distance", "距离" }, { "Radius", "半径" }, { "Range", "范围" }, { "Amount", "数量" },
     { "Value", "数值" }, { "Interval", "间隔" }, { "Delay", "延迟" }, { "Keybind", "按键" },
@@ -255,6 +256,57 @@ local EXACT_PAIRS = {
     { "Refresh Players", "刷新玩家" }, { "Refresh Mobs", "刷新怪物" },
     { "Refresh Selected Mobs", "刷新已选怪物" },
     { "All", "全部" }, { "Stand", "台" }, { "Toggle All", "全选" },
+
+    -- ===== 外挂领域通用术语 =====
+    -- 这一段的定位不是"给某个脚本加词"，而是覆盖整个作弊工具领域的公共词汇。
+    -- 词形还原会自动处理复数/进行时（Exploit -> Exploits / Exploiting），
+    -- 所以这里只写原形，一条能顶好几种变形。
+    -- 作用：这些词机翻必错（Silent Aim→沉默的目标、Dupes→骗子、Exploits→功绩），
+    --       必须在词表这一层钉死，否则界面会出很荒唐的译文。
+
+    -- 作弊 / 功能
+    { "Exploit", "作弊" }, { "Cheat", "作弊" }, { "Hack", "作弊" },
+    { "Script", "脚本" }, { "Executor", "执行器" }, { "Injection", "注入" },
+    { "Inject", "注入" }, { "Bypass", "绕过" }, { "Unlock", "解锁" },
+    { "Feature", "功能" }, { "Module", "模块" }, { "Utility", "工具" },
+
+    -- 战斗
+    { "Aimbot", "自瞄" }, { "Silent Aim", "静默自瞄" }, { "Aim", "瞄准" },
+    { "Triggerbot", "扳机自瞄" }, { "Hitbox", "判定框" }, { "Headshot", "爆头" },
+    { "Critical", "暴击" }, { "Multiplier", "倍数" }, { "Godmode", "无敌模式" },
+    { "God Mode", "无敌模式" }, { "Invincible", "无敌" }, { "Immortal", "不死" },
+    { "Weapon", "武器" }, { "Melee", "近战" }, { "Block", "格挡" }, { "Dodge", "闪避" },
+
+    -- 移动
+    { "Teleport", "传送" }, { "Fly", "飞行" }, { "Sprint", "冲刺" },
+    { "Jump", "跳跃" }, { "Noclip", "穿墙" }, { "Gravity", "重力" },
+    { "WalkSpeed", "移动速度" }, { "JumpPower", "跳跃力" },
+
+    -- 视觉 / ESP
+    { "ESP", "透视" }, { "Wallhack", "透视" }, { "Chams", "透视染色" },
+    { "Highlight", "高亮" }, { "Tracer", "射线" }, { "Skeleton", "骨骼" },
+    { "FOV", "视野" }, { "Health Bar", "血条" },
+
+    -- 物品 / 经济 / 刷取
+    { "Dupe", "复制" }, { "Duplication", "复制" }, { "Item Drop", "掉落物" },
+    { "Drop", "掉落" }, { "Drop Rate", "掉率" }, { "Fishing", "钓鱼" },
+    { "Diving", "潜水" }, { "Mining", "挖矿" }, { "Gather", "采集" },
+    { "Spoof", "伪装" }, { "Spoofing", "伪装" }, { "Luck", "幸运" },
+
+    -- 系统 / 配置
+    { "Toggle", "开关" }, { "Loop", "循环" }, { "Delay", "延迟" },
+    { "Preset", "预设" }, { "Webhook", "网络钩子" }, { "Local", "本地" },
+    { "Server", "服务器" }, { "Exploits", "作弊" },
+
+    -- UI 结构
+    { "Tab", "标签页" }, { "Panel", "面板" }, { "Section", "分区" },
+    { "Window", "窗口" }, { "Button", "按钮" }, { "Slider", "滑块" },
+    { "Checkbox", "复选框" }, { "Dropdown", "下拉框" }, { "Input", "输入框" },
+    { "Visuals", "视觉" }, { "Misc", "杂项" },
+
+    -- 目标
+    { "Target NPC", "目标 NPC" }, { "NPC", "NPC" }, { "Ally", "友方" },
+    { "Self", "自身" }, { "All Players", "所有玩家" },
 
     -- 专有名词直通（保证不会因为"没翻"而整句被拒）
     { "Roblox", "Roblox" }, { "Robux", "Robux" }, { "Discord", "Discord" },
@@ -501,7 +553,17 @@ local function badLeftover(s)
     for w in s:gmatch("[%a][%w']*") do
         if #w >= 2 then
             local lw = w:lower()
-            if not ALLOW_LATIN[lw] then
+            local allow = ALLOW_LATIN[lw]
+            if not allow then
+                -- 缩写常带复数后缀：NPCs / ESPs / AFKs / APIs / IDs
+                -- 不处理的话，译文里一出现这种词整条就被判成"漏翻"而丢弃
+                local stem = lw:gsub("ies$", "y"):gsub("es$", ""):gsub("s$", "")
+                allow = ALLOW_LATIN[stem]
+                if not allow and lw:sub(-1) == "s" then
+                    allow = ALLOW_LATIN[lw:sub(1, -2)]
+                end
+            end
+            if not allow then
                 local ok = false
                 if w:find("%d") then ok = true                       -- W1 / x1 / 3D
                 elseif w:match("^%u%u+$") then ok = true             -- 全大写缩写
@@ -816,6 +878,38 @@ local PROVIDERS = {
     end,
 }
 
+-- 批量翻译：google 端点支持把多条用换行拼起来一次翻完（多 q 参数无效，实测确认）。
+-- 返回按输入顺序对齐的译文数组；条数对不上就返回 nil，由调用方退回逐条翻译。
+-- 这是吞吐的关键：原来一条一请求，队列一堵就是几分钟；批量后一批十几条。
+local function googleBatch(texts)
+    local n = #texts
+    if n == 0 then return nil end
+    if n == 1 then
+        local one = PROVIDERS.google(texts[1])
+        return one and { one } or nil
+    end
+
+    local clean = {}
+    for i = 1, n do
+        -- 换行会破坏批量对齐，先压成空格
+        clean[i] = (tostring(texts[i]):gsub("[\r\n]+", " "))
+    end
+    local body = httpGet("https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t&q="
+        .. urlEncode(table.concat(clean, "\n")))
+    if not body then return nil end
+
+    local segs = {}
+    for tgt in body:gmatch('%["([^"]*)"%s*,%s*"') do
+        if not tgt:match("^%x+$") then
+            local s = jsonUnescape(tgt):gsub("%s+$", "")
+            if s ~= "" then segs[#segs + 1] = s end
+        end
+    end
+    -- 服务端会把长句拆成多段，导致条数错位；这种情况放弃批量，退回逐条更稳
+    if #segs ~= n then return nil end
+    return segs
+end
+
 -- 判断一段文本值不值得送去机翻
 local function worthTranslate(s)
     if type(s) ~= "string" then return false end
@@ -873,6 +967,17 @@ local function workerLoop()
         print("[UIT-CN] 自动翻译已启用，后端: " .. provider)
     end
 
+    local function applyOne(src, tgt)
+        if tgt and tgt ~= "" and tgt:lower() ~= src:lower() then
+            AUTO.cache[src] = tgt
+            CACHE[src] = nil          -- 清掉「翻不出」的负缓存，让 translate 重算
+            AUTO.okCount += 1
+        else
+            AUTO.failCount += 1
+        end
+        AUTO.pending[src] = nil
+    end
+
     while AUTO.enabled do
         local n = #AUTO.queue
         if n == 0 then
@@ -883,34 +988,41 @@ local function workerLoop()
                 batch[i] = table.remove(AUTO.queue, 1)
             end
 
-            local done, total = 0, #batch
-            for _, src in ipairs(batch) do
-                task.spawn(function()
-                    local tgt = nil
-                    for _ = 0, CONFIG.apiRetries do
-                        local ok, r = pcall(PROVIDERS[provider], src)
-                        if ok and type(r) == "string" and r ~= "" then
-                            tgt = r
-                            break
-                        end
-                        task.wait(0.3)
-                    end
-                    if tgt and tgt ~= "" and tgt:lower() ~= src:lower() then
-                        AUTO.cache[src] = tgt
-                        CACHE[src] = nil          -- 清掉「翻不出」的负缓存，让 translate 重算
-                        AUTO.okCount += 1
-                    else
-                        AUTO.failCount += 1
-                    end
-                    AUTO.pending[src] = nil
-                    done += 1
-                end)
+            -- 首选批量：一次请求翻一整批，吞吐提升一个数量级，队列不会再堵
+            local tgtList = nil
+            if provider == "google" then
+                local ok, r = pcall(googleBatch, batch)
+                if ok and type(r) == "table" then tgtList = r end
             end
 
-            local t0 = os.clock()
-            while done < total and (os.clock() - t0) < 20 do
-                task.wait(0.05)
+            if tgtList then
+                for i, src in ipairs(batch) do
+                    applyOne(src, tgtList[i])
+                end
+            else
+                -- 批量失败（条数错位 / 网络抖动）→ 退回逐条，保证不丢
+                local done, total = 0, #batch
+                for _, src in ipairs(batch) do
+                    task.spawn(function()
+                        local tgt = nil
+                        for _ = 0, CONFIG.apiRetries do
+                            local ok, r = pcall(PROVIDERS[provider], src)
+                            if ok and type(r) == "string" and r ~= "" then
+                                tgt = r
+                                break
+                            end
+                            task.wait(0.3)
+                        end
+                        applyOne(src, tgt)
+                        done += 1
+                    end)
+                end
+                local t0 = os.clock()
+                while done < total and (os.clock() - t0) < 20 do
+                    task.wait(0.05)
+                end
             end
+
             if AUTO.onTranslated then pcall(AUTO.onTranslated) end
             task.wait(CONFIG.apiInterval)
         end
