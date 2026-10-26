@@ -1,43 +1,36 @@
 --[[
-    ============================================================
-    UI 中文化 · 通用版  (Universal Roblox UI Translator)
-    English -> 简体中文，实时翻译任意注入脚本的菜单界面
-    ============================================================
+    UI 中文化 · 通用版（Universal Roblox UI Translator）
+    English -> 简体中文，实时翻译任意注入脚本的菜单 / 游戏 HUD
 
-    适用：任意执行器脚本菜单（外挂菜单 / 工具面板 / Hub / 通知窗），
-          不绑定某个具体脚本；也能翻游戏自带 HUD（改配置即可）。
+    用法：执行即可，没有其他步骤。
 
-    能力：
-      · 自动识别：扫描 gethui() / CoreGui，靠「文本量 + 菜单词命中」打分
-        判定哪个 GUI 是脚本菜单，Roblox 自带 UI 自动排除
-      · 三层翻译：精确整串 -> 数字/计时规则 -> 多词短语 -> 单词兜底(带词形还原)
-      · 长句保护：不认识的英文长句保持原文，避免翻出「自动 Farm」这种半截话
-      · 富文本安全：<font color=...> 之类标签原样保留，只翻文字
-      · 动态跟随：切标签、重开面板、脚本自己改文字，都会自动补翻
-      · 可逆：右上角「中/EN」按钮一键切换，原文全部缓存
+    核心机制：
+      1) 识别  扫描 gethui()/CoreGui，用「文本量 + 菜单词命中」打分找出脚本菜单，
+               Roblox 自带 UI 靠黑名单排除
+      2) 词表  高频词本地翻，零延迟。EXACT_PAIRS 只保留核心词，不堆长句
+      3) 机翻  词表翻不出来的自动排队走在线翻译：google -> mymemory -> youdao
+               逐个探测，哪个通用哪个；翻好即时回填界面
+               网络不通就静默退回纯词表模式，不影响其余功能
+      4) 跟随  切标签 / 重开面板 / 脚本自己改文字，都会自动补翻
+      5) 可逆  右上角「中 / EN」按钮一键切换，原文全部缓存
 
-    ── 移动端 / Delta 兼容要点（本版本新增）──────────────
-      · GUI 父级自动降级：gethui -> get_hidden_gui -> CoreGui 写入测试 -> PlayerGui
-        （Delta 各版本对 CoreGui 的开放程度不同，逐级探测，不再硬写 CoreGui）
-      · 去掉已废弃的 Draggable，改成 UserInputService 触摸拖拽，安卓上真能拖
-      · 扫描分帧执行（每帧约 12ms 预算），不会阻塞主线程、不会超时/掉帧
-      · 判定结果带 TTL 缓存 + 已确认实例标记，重扫成本从 O(n²) 降到近 O(n)
-      · 兜底重扫自适应降频（后面越来越慢、最后自动停止），手机省电
-      · LocalPlayer 未就绪时异步等待，不在加载界面报错
-      · 字体 / 属性写入全部 pcall 保护，某个属性被锁也不会中断整个脚本
+    运行后可用：
+      UIT_CN.restore()              还原英文
+      UIT_CN.enable() / disable()   重新翻译 / 暂停
+      UIT_CN.rescan()               立即重扫
+      UIT_CN.diagnose(true)         诊断：每个界面为什么没翻 + 实际英文文本
+      UIT_CN.autoStats()            自动翻译状态（后端 / 缓存 / 队列 / 成败）
+      UIT_CN.auto(false)            关闭自动翻译，只走词表
+      UIT_CN.setProvider("youdao")  指定翻译后端
+      UIT_CN.addPairs({ {"Auto Fish","自动钓鱼"} })   追加词条
+      UIT_CN.stop()                 停止并移除按钮
 
-    用法：
-      执行即可。运行后：
-        getgenv().UIT_CN.restore()      还原英文
-        getgenv().UIT_CN.enable()       重新翻译
-        getgenv().UIT_CN.rescan()       立即重新扫描
-        getgenv().UIT_CN.addPairs({ {"Auto Fish","自动钓鱼"} })  追加词条
-        getgenv().UIT_CN.stop()         停止并移除按钮
-        getgenv().UIT_CN.parent()       查看当前 GUI 挂载到了哪（调试用）
+    界面没翻？三步排查：
+      1) 跑 diagnose()，看卡在哪一条：文本数不够 / 菜单分不够 / 3D 标签没开
+      2) 菜单分不够 —— 往 MARKERS 补几个该界面里的高频词
+      3) 干脆不认 —— CONFIG.forceInclude = { "windui", "onyx" }，填名字片段必翻
 
-    想加自己的翻译：往 EXACT_PAIRS 里加 { "English", "中文" } 即可，
-    单词会进单词表，多词会进短语表（大小写不敏感）。
-    ============================================================
+    所有开关都在下面 CONFIG 里，改完重新执行即可。
 ]]
 
 local CONFIG = {
@@ -48,14 +41,37 @@ local CONFIG = {
     rescanSeconds    = 180,    -- 兜底重扫持续时间（秒）；手机别太长
     rescanInterval   = 1.5,    -- 兜底重扫间隔（秒），会自适应变慢
     rescanMaxGap     = 6,      -- 兜底重扫间隔上限（秒）
-    minTextsForMenu  = 24,     -- 判定菜单：GUI 内文本元素下限
-    minMenuScore     = 3,      -- 判定菜单：命中菜单特征词的数量下限
+    minTextsForMenu  = 8,      -- 判定菜单：GUI 内文本元素下限
+                               --   原 24 太高：卡片式/小面板菜单（如 22 个文本的注入面板）会被整体跳过
+    minMenuScore     = 1,      -- 判定菜单：命中菜单特征词的数量下限
+                               --   原 3 太高：那是按 FPS 外挂词表定的，赛车/模拟/经营类脚本命中不到
     bigTextsForMenu  = 80,     -- 文本多到一定程度直接判为菜单（不做严格模式）
     strictNoMixed    = true,   -- 严格模式：译文里还有没翻掉的英文词就整条保留原文（不出半中半英）
     maxLeftRatio     = 0.4,    -- 兼容旧配置，留作参考
     includeNames     = {},     -- 强制纳入的 GUI 名（小写子串），如 { "hub", "menu" }
     extraExclude     = {},     -- 额外排除的 GUI 名（小写）
     verbose          = true,
+
+    -- 目标 GUI 名：不知道名字时先跑 getgenv().UIT_CN.diagnose() 看一份清单再填这里
+    -- 填了之后该 GUI 无条件翻译，绕过所有打分逻辑（最保险的做法）
+    forceInclude     = {},
+
+    -- 是否连游戏自己的 3D 世界标签（BillboardGui / SurfaceGui）一起翻
+    -- 例：车行招牌、箱子标签；默认 off，避免翻到满地图的广告牌
+    includeBillboard = false,
+
+    -- ===== 自动翻译（词表没覆盖的文本，走在线翻译）=====
+    -- 打开后不再需要手动往 EXACT_PAIRS 加词条：词表命中就本地翻（快），
+    -- 没命中就排队调用在线接口，结果写进缓存并立即应用到界面上。
+    autoTranslate   = true,
+    apiProvider     = "auto",   -- auto | google | mymemory | youdao
+    apiBatch        = 4,        -- 每批同时处理几条
+    apiInterval     = 0.25,     -- 每批之间的间隔（秒），别调太小以免被限流
+    apiTimeoutMs    = 8000,
+    apiRetries      = 1,
+    maxQueue        = 300,      -- 待翻译队列上限，防止一次塞爆
+    maxTextLen      = 160,      -- 超过这个长度的不进自动翻译（长句机翻很烂）
+    skipPlayerNames = true,     -- 跳过玩家名，不翻成人名乱码
 
     -- ===== 移动端 / 执行器兼容参数 =====
     frameBudget      = 0.012,  -- 单帧扫描时间预算（秒），越小越不卡
@@ -170,388 +186,78 @@ end
 -- 1. 词库：通用界面 / 功能 / 设置术语
 ----------------------------------------------------------------
 local EXACT_PAIRS = {
-    -- 框架与标签
+    -- 只放「高频 + 机翻容易翻错」的核心词，其余全部交给自动翻译引擎。
+    -- 不要再往这里堆长句了：实测长句机翻质量比手写词条还自然，
+    -- 堆词条只会让文件膨胀，却换不来更好的效果。
+
+    -- 菜单骨架
     { "Menu", "菜单" }, { "Main", "主界面" }, { "Home", "首页" }, { "General", "常规" },
-    { "Settings", "设置" }, { "Setting", "设置" }, { "Config", "配置" }, { "Configs", "配置" },
-    { "Configuration", "配置" }, { "Options", "选项" }, { "Advanced", "高级" }, { "Extras", "扩展" },
-    { "Misc", "杂项" }, { "Miscellaneous", "杂项" }, { "Utilities", "实用工具" }, { "Utility", "工具" },
-    { "Tools", "工具" }, { "Features", "功能" }, { "Modules", "模块" }, { "Plugins", "插件" },
-    { "Debug", "调试" }, { "Developer", "开发者" }, { "About", "关于" }, { "Info", "信息" },
-    { "Credits", "制作名单" }, { "Version", "版本" }, { "Update", "更新" }, { "Changelog", "更新日志" },
-    { "Language", "语言" }, { "Theme", "主题" }, { "Dark", "深色" }, { "Light", "浅色" },
-    { "Profile", "配置文件" }, { "Profiles", "配置文件" }, { "Preset", "预设" }, { "Presets", "预设" },
-    { "Slot", "存档位" }, { "Slots", "存档位" }, { "Session", "会话" }, { "Status", "状态" },
-    { "State", "状态" }, { "Uptime", "运行时长" }, { "Log", "日志" }, { "Logs", "日志" },
-    { "Console", "控制台" }, { "Notifications", "通知" }, { "Notification", "通知" },
-    { "Hub", "中心" }, { "Script Hub", "脚本库" }, { "Scripts", "脚本" }, { "Script", "脚本" },
+    { "Settings", "设置" }, { "Options", "选项" }, { "Config", "配置" }, { "Advanced", "高级" },
+    { "Misc", "杂项" }, { "Info", "信息" }, { "About", "关于" }, { "Version", "版本" },
+    { "Close", "关闭" }, { "Exit", "退出" }, { "Back", "返回" }, { "Next", "下一步" },
+    { "Confirm", "确认" }, { "Cancel", "取消" }, { "Apply", "应用" }, { "Save", "保存" },
+    { "Load", "加载" }, { "Reset", "重置" }, { "Default", "默认" }, { "Restore", "恢复" },
+    { "Yes", "是" }, { "No", "否" }, { "On", "开" }, { "Off", "关" },
+    { "Enable", "启用" }, { "Disable", "禁用" }, { "Enabled", "已启用" }, { "Disabled", "已禁用" },
+    { "Auto", "自动" }, { "Manual", "手动" }, { "Toggle", "开关" }, { "Option", "选项" },
 
-    -- 按钮 / 操作
-    { "Save", "保存" }, { "Load", "加载" }, { "Reset", "重置" }, { "Restore", "恢复" },
-    { "Default", "默认" }, { "Apply", "应用" }, { "Confirm", "确认" }, { "Cancel", "取消" },
-    { "Close", "关闭" }, { "Open", "打开" }, { "Exit", "退出" }, { "Back", "返回" },
-    { "Next", "下一个" }, { "Previous", "上一个" }, { "Continue", "继续" }, { "OK", "确定" },
-    { "Yes", "是" }, { "No", "否" }, { "Done", "完成" }, { "Submit", "提交" },
-    { "Send", "发送" }, { "Copy", "复制" }, { "Paste", "粘贴" }, { "Clear", "清空" },
-    { "Delete", "删除" }, { "Remove", "移除" }, { "Add", "添加" }, { "Create", "创建" },
-    { "Edit", "编辑" }, { "Rename", "重命名" }, { "Select", "选择" }, { "Select All", "全选" },
-    { "Selected", "已选" }, { "Search", "搜索" }, { "Find", "查找" }, { "Filter", "筛选" },
-    { "Sort", "排序" }, { "Refresh", "刷新" }, { "Reload", "重载" }, { "Import", "导入" },
-    { "Export", "导出" }, { "Share", "分享" }, { "Backup", "备份" }, { "Upload", "上传" },
-    { "Download", "下载" }, { "Retry", "重试" }, { "Try Again", "重试" }, { "Undo", "撤销" },
+    -- 货币 / 进度
+    { "Level", "等级" }, { "Lvl", "等级" }, { "Exp", "经验" }, { "XP", "经验" },
+    { "Coins", "金币" }, { "Coin", "金币" }, { "Gems", "宝石" }, { "Gem", "宝石" },
+    { "Cash", "现金" }, { "Money", "金钱" }, { "Credits", "积分" }, { "Credit", "积分" },
+    { "Tokens", "代币" }, { "Balance", "余额" }, { "Price", "价格" }, { "Cost", "花费" },
+    { "Total", "总计" }, { "Reward", "奖励" }, { "Rewards", "奖励" }, { "Claim", "领取" },
+    { "Collect", "领取" }, { "Progress", "进度" }, { "Rank", "排名" }, { "Streak", "连胜" },
 
-    -- 开关状态
-    { "Toggle", "开关" }, { "Enable", "启用" }, { "Disable", "禁用" }, { "Enabled", "已启用" },
-    { "Disabled", "已禁用" }, { "On", "开" }, { "Off", "关" }, { "True", "真" }, { "False", "假" },
-    { "Active", "已激活" }, { "Inactive", "未激活" }, { "Locked", "已锁定" }, { "Unlocked", "已解锁" },
-    { "Premium", "高级版" }, { "Free", "免费" }, { "Beta", "测试版" }, { "Alpha", "内测版" },
+    -- 商店 / 背包 / 物品
+    { "Shop", "商店" }, { "Store", "商店" }, { "Market", "市场" }, { "Crate", "箱子" },
+    { "Inventory", "背包" }, { "Backpack", "背包" }, { "Item", "物品" }, { "Items", "物品" },
+    { "Buy", "购买" }, { "Sell", "出售" }, { "Purchase", "购买" }, { "Trade", "交易" },
+    { "Equip", "装备" }, { "Unequip", "卸下" }, { "Upgrade", "升级" }, { "Unlock", "解锁" },
 
-    -- 输入 / 按键
-    { "Key", "按键" }, { "Keybind", "快捷键" }, { "Keybinds", "快捷键" }, { "Hotkey", "热键" },
-    { "Hotkeys", "热键" }, { "Bind", "绑定" }, { "Unbind", "解绑" }, { "Press", "按下" },
-    { "Hold", "长按" }, { "Click", "点击" }, { "Double Click", "双击" }, { "Right Click", "右键" },
-    { "Left Click", "左键" }, { "Drag", "拖动" }, { "Drop", "丢弃" }, { "Window Key", "窗口按键" },
+    -- 玩法通用
+    { "Start", "开始" }, { "Stop", "停止" }, { "Pause", "暂停" }, { "Resume", "继续" },
+    { "Restart", "重新开始" }, { "Ready", "准备" }, { "Leave", "离开" }, { "Join", "加入" },
+    { "Map", "地图" }, { "Mode", "模式" }, { "Stage", "关卡" }, { "Mission", "任务" },
+    { "Quest", "任务" }, { "Challenge", "挑战" }, { "Score", "得分" },
 
-    -- 数值 / 参数
-    { "Name", "名称" }, { "Type", "类型" }, { "Value", "数值" }, { "Amount", "数量" },
-    { "Limit", "限制" }, { "Min", "最小" }, { "Max", "最大" }, { "Random", "随机" },
-    { "Randomize", "随机化" }, { "Manual", "手动" }, { "Auto", "自动" }, { "Always", "始终" },
-    { "Never", "从不" }, { "Once", "一次" }, { "Repeat", "重复" }, { "Loop", "循环" },
-    { "Infinite", "无限" }, { "Unlimited", "无限" }, { "Time", "时间" }, { "Timer", "计时器" },
-    { "Delay", "延迟" }, { "Interval", "间隔" }, { "Duration", "持续时间" }, { "Cooldown", "冷却" },
-    { "Speed", "速度" }, { "Rate", "速率" }, { "Size", "大小" }, { "Scale", "缩放" },
-    { "Distance", "距离" }, { "Range", "范围" }, { "Radius", "半径" }, { "Height", "高度" },
-    { "Width", "宽度" }, { "Angle", "角度" }, { "Multiplier", "倍率" }, { "Percent", "百分比" },
-    { "Percentage", "百分比" }, { "Chance", "概率" }, { "Priority", "优先级" }, { "Order", "顺序" },
+    -- 赛车 / 驾驶（实测高频，本地翻省请求）
+    { "Race", "比赛" }, { "Racing", "比赛" }, { "Rally", "拉力赛" }, { "Car", "车辆" },
+    { "Cars", "车辆" }, { "Vehicle", "载具" }, { "Drive", "驾驶" }, { "Driving", "驾驶" },
+    { "Speed", "速度" }, { "Boost", "加速" }, { "Nitro", "氮气" }, { "Drift", "漂移" },
+    { "Lap", "圈" }, { "Laps", "圈" }, { "Checkpoint", "检查点" }, { "Finish", "终点" },
+    { "Position", "名次" }, { "Garage", "车库" }, { "Engine", "引擎" }, { "Tires", "轮胎" },
 
-    -- 数值单位
-    { "Studs", "格" }, { "Seconds", "秒" }, { "Milliseconds", "毫秒" }, { "Minutes", "分钟" },
-    { "Hours", "小时" }, { "HP", "生命" }, { "MP", "法力" }, { "XP", "经验" },
-    { "Coins", "金币" }, { "Gems", "宝石" }, { "Cash", "现金" }, { "Money", "金钱" },
-    { "Tokens", "代币" }, { "Points", "积分" }, { "Score", "分数" }, { "Rank", "排名" },
-    { "Tier", "阶级" }, { "Stage", "关卡" }, { "Wave", "波数" }, { "Round", "回合" },
-    { "Match", "对局" }, { "Level", "等级" }, { "Exp", "经验" }, { "Ping", "延迟" }, { "FPS", "帧率" },
+    -- 玩家 / 战斗 / 数值
+    { "Player", "玩家" }, { "Players", "玩家" }, { "Team", "队伍" }, { "Health", "生命" },
+    { "Damage", "伤害" }, { "Status", "状态" }, { "Online", "在线" }, { "Ping", "延迟" },
+    { "Distance", "距离" }, { "Radius", "半径" }, { "Range", "范围" }, { "Amount", "数量" },
+    { "Value", "数值" }, { "Interval", "间隔" }, { "Delay", "延迟" }, { "Keybind", "按键" },
 
-    -- 对象 / 场景
-    { "Game", "游戏" }, { "Games", "游戏" }, { "Server", "服务器" }, { "Region", "地区" },
-    { "Player", "玩家" }, { "Players", "玩家" }, { "Self", "自己" }, { "Others", "其他人" },
-    { "Enemy", "敌人" }, { "Enemies", "敌人" }, { "Team", "队伍" }, { "Teammates", "队友" },
-    { "Friends", "好友" }, { "All", "全部" }, { "None", "无" }, { "Everyone", "所有人" },
-    { "Target", "目标" }, { "Targets", "目标" }, { "Nearest", "最近" }, { "Closest", "最近" },
-    { "Farthest", "最远" }, { "Character", "角色" }, { "Avatar", "形象" }, { "Inventory", "背包" },
-    { "Backpack", "背包" }, { "Shop", "商店" }, { "Store", "商店" }, { "Market", "市场" },
-    { "Trade", "交易" }, { "Weapon", "武器" }, { "Weapons", "武器" }, { "Item", "物品" },
-    { "Items", "物品" }, { "Armor", "护甲" }, { "Shield", "护盾" }, { "Ammo", "弹药" },
+    -- 游戏术语修正：机翻在这些词上必错（Auto→汽车、Mob→暴民、Farming→耕作）
+    -- 词表优先于机翻，所以这类高频术语写在这里就等于强行纠正译法
+    { "Auto", "自动" }, { "Farm", "刷取" }, { "Farming", "刷取" },
+    { "Autofarm", "自动刷取" }, { "Mob", "怪物" }, { "Mobs", "怪物" },
+    { "Monster", "怪物" }, { "Monsters", "怪物" }, { "Enemy", "敌人" },
+    { "Attack", "攻击" }, { "Summon", "召唤" }, { "Moves", "移动" },
+    { "AFK", "挂机" }, { "Refresh", "刷新" }, { "Selected", "已选中" },
+    { "Priority", "优先级" }, { "List", "列表" }, { "Kill", "击杀" },
+    { "Spawn", "生成" }, { "Loop", "循环" }, { "Automation", "自动化" },
+    { "Quality of Life", "便捷功能" },
+    { "Auto Farm", "自动刷取" }, { "Autofarm Settings", "自动刷取设置" },
+    { "Item Farming", "刷物品" }, { "Auto Item Farm", "自动刷物品" },
+    { "Mob Farming", "刷怪" }, { "Player Farming", "刷玩家" },
+    { "Auto Mob Farm", "自动刷怪" }, { "Auto Mob Farm ALL", "自动刷所有怪" },
+    { "Auto Farm Player", "自动刷玩家" }, { "Mob Priority List", "怪物优先级列表" },
+    { "Target Player", "目标玩家" }, { "Auto Attack", "自动攻击" },
+    { "Auto Moves", "自动移动" }, { "Auto Summon", "自动召唤" },
+    { "Anti AFK", "防挂机" }, { "Auto Enter", "自动进入" },
+    { "Refresh Players", "刷新玩家" }, { "Refresh Mobs", "刷新怪物" },
+    { "Refresh Selected Mobs", "刷新已选怪物" },
+    { "All", "全部" }, { "Stand", "台" }, { "Toggle All", "全选" },
 
-    -- 属性
-    { "Health", "生命" }, { "Mana", "法力" }, { "Stamina", "体力" }, { "Energy", "能量" },
-    { "Damage", "伤害" }, { "Defense", "防御" }, { "Attack", "攻击" }, { "Crit", "暴击" },
-    { "Critical", "暴击" }, { "Luck", "幸运" }, { "Strength", "力量" }, { "Agility", "敏捷" },
-    { "Intelligence", "智力" }, { "Armor Boost", "护甲加成" }, { "Health Boost", "生命加成" },
-    { "Damage Boost", "伤害加成" }, { "Life Steal", "吸血" }, { "Thorns", "荆棘" },
-
-    -- 动作
-    { "Jump", "跳跃" }, { "Walk", "行走" }, { "Run", "奔跑" }, { "Sprint", "冲刺" },
-    { "Dash", "疾跑" }, { "Fly", "飞行" }, { "Swim", "游泳" }, { "Climb", "攀爬" },
-    { "Crouch", "蹲下" }, { "Glide", "滑翔" }, { "Teleport", "传送" }, { "Teleports", "传送" },
-    { "Movement", "移动" }, { "Sell", "出售" }, { "Buy", "购买" }, { "Purchase", "购买" },
-    { "Equip", "装备" }, { "Unequip", "卸下" }, { "Use", "使用" }, { "Consume", "消耗" },
-    { "Pickup", "拾取" }, { "Collect", "收集" }, { "Gather", "采集" }, { "Harvest", "收获" },
-    { "Mine", "挖矿" }, { "Chop", "砍伐" }, { "Fish", "钓鱼" }, { "Cook", "烹饪" },
-    { "Craft", "制作" }, { "Upgrade", "升级" }, { "Refine", "精炼" }, { "Merge", "合成" },
-    { "Unlock", "解锁" }, { "Redeem", "兑换" }, { "Claim", "领取" }, { "Reward", "奖励" },
-    { "Rewards", "奖励" }, { "Quest", "任务" }, { "Quests", "任务" }, { "Mission", "任务" },
-    { "Missions", "任务" }, { "Task", "任务" }, { "Tasks", "任务" }, { "Objective", "目标" },
-    { "Daily", "每日" }, { "Weekly", "每周" }, { "Boss", "首领" }, { "Dungeon", "地下城" },
-    { "Raid", "突袭" }, { "Raids", "突袭" }, { "Arena", "竞技场" }, { "Party", "队伍" },
-    { "Lobby", "大厅" }, { "Spawn", "出生点" }, { "Map", "地图" }, { "World", "世界" },
-    { "Zone", "区域" }, { "Area", "区域" }, { "Location", "位置" }, { "Waypoint", "传送点" },
-    { "Marker", "标记" }, { "Checkpoint", "检查点" }, { "Combat", "战斗" }, { "Farming", "刷取" },
-    { "Farm", "挂机" }, { "Fishing", "钓鱼" }, { "Survival", "生存" }, { "Recovery", "恢复" },
-
-    -- 外挂功能
-    { "Visuals", "视觉" }, { "Render", "渲染" }, { "Graphics", "画面" }, { "ESP", "透视" },
-    { "Box ESP", "方框透视" }, { "Name ESP", "名字透视" }, { "Health ESP", "血量透视" },
-    { "Tracer", "追踪线" }, { "Tracers", "追踪线" }, { "Chams", "骨骼透视" }, { "Highlight", "高亮" },
-    { "Aimbot", "自瞄" }, { "Aim", "瞄准" }, { "Aim Assist", "辅助瞄准" }, { "Silent Aim", "静默瞄准" },
-    { "Trigger Bot", "自动开火" }, { "Auto Aim", "自动瞄准" }, { "FOV", "视野范围" },
-    { "Smoothing", "平滑度" }, { "Sensitivity", "灵敏度" }, { "Prediction", "预判" },
-    { "Hitbox", "判定框" }, { "Hitboxes", "判定框" }, { "Team Check", "队伍检测" },
-    { "Wall Check", "墙体检测" }, { "Visible Check", "可见检测" }, { "Whitelist", "白名单" },
-    { "Blacklist", "黑名单" }, { "Exploit", "漏洞" }, { "Exploits", "漏洞" },
-    { "Anti-Cheat", "反作弊" }, { "Anti-Ban", "防封" }, { "Anti Kick", "防踢" },
-    { "Anti-AFK", "防挂机" }, { "Bypass", "绕过" }, { "God Mode", "无敌" }, { "Godmode", "无敌" },
-    { "Noclip", "穿墙" }, { "No Clip", "穿墙" }, { "Fullbright", "全亮" }, { "No Fog", "去雾" },
-    { "Walk Speed", "移动速度" }, { "WalkSpeed", "移动速度" }, { "Jump Power", "跳跃力" },
-    { "JumpPower", "跳跃力" }, { "Infinite Jump", "无限跳跃" }, { "Infinite Ammo", "无限弹药" },
-    { "Fire Rate", "射速" }, { "Firerate", "射速" }, { "Recoil", "后坐力" }, { "Spread", "散布" },
-    { "Fast Attack", "快速攻击" }, { "Instant", "瞬间" }, { "Fast", "快速" }, { "Slow", "慢速" },
-    { "Tween", "缓动" }, { "Orbit", "环绕" }, { "Hover", "悬停" }, { "Highlight Target", "高亮目标" },
-
-    -- 自动化
-    { "Auto Farm", "自动挂机" }, { "Auto Click", "自动点击" }, { "Auto Clicker", "自动点击器" },
-    { "Auto Fish", "自动钓鱼" }, { "Auto Quest", "自动任务" }, { "Auto Sell", "自动出售" },
-    { "Auto Buy", "自动购买" }, { "Auto Pickup", "自动拾取" }, { "Auto Collect", "自动收集" },
-    { "Auto Use", "自动使用" }, { "Auto Potion", "自动药水" }, { "Auto Dodge", "自动闪避" },
-    { "Auto Parry", "自动格挡" }, { "Auto Block", "自动格挡" }, { "Auto Heal", "自动回血" },
-    { "Auto Respawn", "自动复活" }, { "Auto Rejoin", "自动重进" }, { "Auto Reconnect", "自动重连" },
-    { "Auto Skip", "自动跳过" }, { "Auto Equip", "自动装备" }, { "Auto Upgrade", "自动升级" },
-    { "Auto Roll", "自动抽取" }, { "Auto Gather", "自动采集" }, { "Auto Attack", "自动攻击" },
-    { "Auto Play", "自动开始" }, { "Auto Claim", "自动领取" }, { "Auto Reward", "自动领取" },
-    { "Auto Ability", "自动技能" }, { "Auto Teleport", "自动传送" },
-
-    -- 状态提示
-    { "Loading", "加载中" }, { "Loaded", "已加载" }, { "Ready", "就绪" }, { "Waiting", "等待中" },
-    { "Success", "成功" }, { "Failed", "失败" }, { "Error", "错误" }, { "Warning", "警告" },
-    { "Connected", "已连接" }, { "Disconnected", "已断开" }, { "Online", "在线" }, { "Offline", "离线" },
-    { "No Results", "无结果" }, { "Not Found", "未找到" }, { "Empty", "空" }, { "Unknown", "未知" },
-    { "Coming Soon", "即将推出" }, { "Are You Sure", "确定吗" }, { "Reconnect", "重连" },
-    { "Rejoin", "重进" }, { "Owner", "所有人" }, { "Admin", "管理员" }, { "User", "用户" },
-    { "Username", "用户名" }, { "Password", "密码" }, { "Discord", "Discord" }, { "Executor", "执行器" },
-
-    -- 游戏包：Generic Pixel Blade Hub（不需要可整段删掉）
-    { "KEYLESS - SCAM IF KEY NEEDED", "无密钥 · 要密钥就是骗局" },
-    { "created by adn", "作者 adn" }, { "Unload Script", "卸载脚本" }, { "Menu Launcher", "菜单启动器" },
-    { "Search settings", "搜索设置" }, { "Wishes", "愿望" }, { "Chests", "宝箱" },
-    { "Dark Keys", "暗黑钥匙" }, { "Charms", "护符" }, { "Charm", "护符" }, { "Donate", "赞助" },
-    { "Kill Aura", "击杀光环" }, { "Swing every (s)", "挥动间隔 (秒)" }, { "Radius (studs)", "半径 (格)" },
-    { "Hit props", "攻击场景物件" }, { "Use below (% HP)", "低于时使用 (% 生命)" },
-    { "Movement", "移动方式" }, { "Side", "侧向" }, { "Above", "上方" }, { "Distance (studs)", "距离 (格)" },
-    { "Tween speed (studs/s)", "缓动速度 (格/秒)" }, { "Idle Height (studs)", "悬停高度 (格)" },
-    { "Potato Graphics", "土豆画质" }, { "Regular FPS Boost", "常规帧率提升" },
-    { "Disable 3D rendering", "关闭 3D 渲染" }, { "Highlight Dark Chests", "高亮暗黑宝箱" },
-    { "Pause All", "全部暂停" }, { "Pause key", "暂停按键" }, { "Average run", "平均用时" },
-    { "Recent runs", "最近记录" }, { "No runs yet this session", "本局暂无记录" },
-    { "Ended", "已结束" }, { "Running", "进行中" }, { "In the run", "局内" },
-    { "Waiting for the game state", "等待游戏状态" }, { "Deaths", "死亡次数" }, { "Catches", "钓获" },
-    { "Classic Pole", "经典钓竿" }, { "Equipped", "已装备" }, { "Anti-AFK", "防挂机" },
-    { "Auto Escape Grabs", "自动挣脱抓取" }, { "No active features", "暂无激活功能" },
-    { "Farm Plan: W1 Normal", "挂机计划: W1 普通" }, { "Follow the farm plan", "按挂机计划执行" },
-    { "Farm Together", "一起挂机" }, { "Force Group", "强制组队" }, { "Auto world", "自动世界" },
-    { "Where", "位置" }, { "Leave at wave", "波次离开" }, { "Leave at (chests)", "剩余宝箱数离开" },
-    { "Leave runs to open", "留几次开箱" }, { "Leave runs to turn in", "留几次交任务" },
-    { "Move to safe spot", "移动到安全点" }, { "Stall time (s)", "停滞时间 (秒)" },
-    { "Wait limit (s)", "等待上限 (秒)" }, { "Target classes", "目标职业" },
-    { "Morvik Teammate Rescue", "Morvik 队友救援" }, { "Show on Hover", "悬停显示" },
-    { "Grasslands", "草原" }, { "Island Details", "岛屿详情" }, { "Auto Continue", "自动继续" },
-    { "Auto Pick Card", "自动选卡" }, { "Auto Replay", "自动重开" }, { "Auto Skip Cutscenes", "自动跳过过场" },
-    { "Auto Revive", "自动复活" }, { "Auto Merge Books", "自动合成书籍" }, { "Auto Open Chests", "自动开宝箱" },
-    { "Open All Chests", "打开所有宝箱" }, { "Auto Open Dark Chests", "自动开暗黑宝箱" },
-    { "Auto Open Wishes", "自动开愿望" }, { "Auto Buy Daily Shop", "自动购买每日商店" },
-    { "Auto Charm Prize", "自动护符奖励" }, { "Charm Prize Priority", "护符奖励优先级" },
-    { "Configure Charm Prize", "配置护符奖励" }, { "Auto Equip Best", "自动装备最优" },
-    { "Auto Equip Charm", "自动装备护符" }, { "Auto Execute", "自动处决" }, { "Class roll", "职业抽取" },
-    { "Cards", "卡片" }, { "Card ranks", "卡片等级" }, { "Your charms", "你的护符" },
-    { "No charms yet", "暂无护符" }, { "Use selected charm", "使用所选护符" },
-    { "Most Luck", "最高幸运" }, { "Most Owned", "拥有最多" }, { "Fallback to most owned", "回退到拥有最多" },
-    { "Ultimate Charm", "终极护符" }, { "Equip Best", "装备最优" }, { "Reaper (0.5%)", "死神 (0.5%)" },
-    { "Bait", "鱼饵" }, { "Bait Fallback", "鱼饵备选" }, { "Fishing rod", "钓竿" },
-    { "Fast Fishing", "快速钓鱼" }, { "Worms", "蠕虫" }, { "Potions", "药水" },
-    { "Potion Restock", "药水补货" }, { "Restock below", "低于时补货" },
-    { "Auto-buy potions", "自动购买药水" }, { "Auto Upgrade Rod", "自动升级钓竿" },
-    { "Auto Upgrade Stash", "自动升级仓库" }, { "Upgrade All", "全部升级" },
-    { "Upgrade Check", "升级检查" }, { "Upgrade Plan", "升级计划" }, { "Upgrade rarities", "升级稀有度" },
-    { "Items maxed", "已满级物品" }, { "Nothing left to max", "已无可提升项" },
-    { "No Legendary drops found for this world", "本世界没有传说掉落" },
-    { "Quality Check", "品质检查" }, { "Melt Rings", "熔炼戒指" }, { "Melt Ring Tier", "熔炼戒指阶级" },
-    { "Melt Ring Type", "熔炼戒指类型" }, { "Melt quality at or below", "熔炼品质低于或等于" },
-    { "Refine All", "全部精炼" }, { "Refine Ring Type", "精炼戒指类型" }, { "Unveil Rings", "揭示戒指" },
-    { "Auto Unveil Pages", "自动揭示书页" }, { "Rings", "戒指" }, { "Rings per press", "每次按键戒指数" },
-    { "Rarity", "稀有度" }, { "Item rarities", "物品稀有度" }, { "Common, Rare +1", "普通、稀有 +1" },
-    { "Legendary", "传说" }, { "Heroic", "英雄" }, { "Vaulted", "已封存" },
-    { "Nightmare", "噩梦" }, { "Dungeon - Normal", "地下城 · 普通" }, { "Raid waves", "突袭波数" },
-    { "Max players", "最大玩家数" }, { "Armory", "军械库" }, { "Element Circle", "元素环" },
-    { "Flame Element", "火焰元素" }, { "Frost Element", "冰霜元素" }, { "Poison Element", "毒素元素" },
-    { "Rage Spirits", "狂怒之灵" }, { "Use luck circles", "使用幸运圈" },
-    { "Critical Boost", "暴击加成" }, { "Spirit Capacity", "灵魂容量" },
-    { "Speed (deg/s)", "速度 (度/秒)" }, { "Difficulty", "难度" }, { "Client", "客户端" },
-    { "Refresh list", "刷新列表" }, { "Sell everything", "出售全部" }, { "Sell Stash Now", "立即出售仓库" },
-    { "Buy chests", "购买宝箱" }, { "Redeem Codes", "兑换码" }, { "Dynamic Island", "灵动岛" },
-    { "UI Scale (%)", "UI 缩放 (%)" }, { "Click or press Delete to open", "点击或按 Delete 打开" },
-    { "Reset order", "重置顺序" }, { "Clear all", "清空全部" }, { "Clear auto-load", "清空自动加载" },
-    { "Set auto-load", "设置自动加载" }, { "Auto-load", "自动加载" }, { "Auto-sell", "自动出售" },
-    { "Share code", "分享码" }, { "No config loaded", "未加载配置" }, { "Delete Config", "删除配置" },
-    { "Copy Config", "复制配置" }, { "Apply Config", "应用配置" }, { "Config Sharing", "配置共享" },
-    { "Configure", "配置" },     { "Dungeon Lobby", "地下城大厅" }, { "Generic Pixel Blade Hub", "通用像素之刃 Hub" },
-
-    -- 通用补充（高频零碎词）
-    { "List", "列表" }, { "Set", "设置" }, { "Found", "找到" }, { "Result", "结果" },
-    { "Mode", "模式" }, { "Pause", "暂停" }, { "Resume", "继续" }, { "Runs", "次数" },
-    { "Highest", "最高" }, { "Lowest", "最低" }, { "Skip", "跳过" }, { "Epic", "史诗" },
-    { "Dealer", "商人" }, { "Iron", "铁" }, { "Pole", "钓竿" }, { "Rarity Boost", "稀有度加成" },
-    { "No Results Found", "未找到结果" }, { "Farm Plan", "挂机计划" },
-    { "Normal", "普通" }, { "Hard", "困难" }, { "Easy", "简单" }, { "Expert", "专家" },
-    { "Master", "大师" }, { "Easy Mode", "简单模式" }, { "Hard Mode", "困难模式" },
-    { "WASD or joystick to fly; Space up, Alt down; look up/down on phones", "WASD 或摇杆飞行；空格上升、Alt 下降；手机上抬头/低头" },
-    { "Priority: 1 Highest, 3 Lowest; 0 Skip", "优先级: 1 最高，3 最低；0 跳过" },
-    { "Earn Wishes from Morvik (W5), fishing, daily login or purchases.", "通过 Morvik(W5)、钓鱼、每日登录或购买获得愿望。" },
-    { "Takes your top-ranked unmaxed Legendary; else the lowest-tier unmaxed item; else random", "优先取未满级的最高阶传说；否则取最低阶未满级物品；否则随机" },
-    { "Will equip Super Charm [Epic] at the dealer", "在商人处自动装备超级护符 [史诗]" },
-
-    -- ===== 扩充词库 v2：补齐「半英半中」的漏词 =====
-
-    -- 程度 / 前缀
-    { "Super", "超级" }, { "Ultra", "终极" }, { "Mega", "巨型" }, { "Extreme", "极限" },
-    { "Absolute", "绝对" }, { "Total", "总计" }, { "Partial", "部分" }, { "Fully", "完全" },
-    { "Half", "一半" }, { "Double", "双倍" }, { "Triple", "三倍" }, { "Extra", "额外" },
-    { "Bonus", "额外加成" }, { "Boost", "提升" }, { "Reduce", "降低" }, { "Increase", "增加" },
-    { "Decrease", "减少" }, { "Max", "最大" }, { "Min", "最小" }, { "Medium", "中等" },
-    { "Low", "低" }, { "High", "高" }, { "Tiny", "极小" }, { "Huge", "巨大" },
-    { "Full", "完整" }, { "Short", "短" }, { "Long", "长" }, { "Basic", "基础" },
-    { "Simple", "简单" }, { "Complex", "复杂" }, { "Fixed", "固定" }, { "Dynamic", "动态" },
-    { "Custom", "自定义" }, { "Precise", "精准" }, { "Accurate", "精准" }, { "Smart", "智能" },
-    { "Stable", "稳定" }, { "Smooth", "平滑" }, { "Rapid", "快速" }, { "Safe", "安全" },
-    { "Unsafe", "不安全" }, { "Danger", "危险" }, { "Risky", "有风险" }, { "Silent", "静默" },
-    { "Legit", "拟真" }, { "Rage", "暴力" }, { "Blatant", "明显" }, { "Visible", "可见" },
-    { "Hidden", "隐藏" }, { "Reverse", "反向" }, { "Invert", "反转" }, { "Swap", "交换" },
-    { "Mirror", "镜像" }, { "Flip", "翻转" }, { "Rotate", "旋转" }, { "Zoom", "缩放" },
-    { "Always On", "常开" }, { "Always Off", "常关" }, { "On Top", "置顶" }, { "Toggle On", "开启" },
-    { "Turn On", "开启" }, { "Turn Off", "关闭" }, { "Turned On", "已开启" }, { "Turned Off", "已关闭" },
-
-    -- 常用动词
-    { "Now", "立即" }, { "Soon", "即将" }, { "Later", "稍后" }, { "Disconnect", "断开" },
-    { "Connect", "连接" }, { "Connecting", "连接中" }, { "Reconnecting", "重连中" },
-    { "Kick", "踢出" }, { "Ban", "封禁" }, { "Detect", "检测" }, { "Detected", "已检测" },
-    { "Ignore", "忽略" }, { "Ignored", "已忽略" }, { "Follow", "跟随" }, { "Chase", "追击" },
-    { "Dodge", "闪避" }, { "Parry", "格挡" }, { "Block", "格挡" }, { "Grab", "抓取" },
-    { "Escape", "挣脱" }, { "Revive", "复活" }, { "Respawn", "重生" }, { "Start", "开始" },
-    { "Stop", "停止" }, { "Pause", "暂停" }, { "Finish", "完成" }, { "Complete", "完成" },
-    { "Completed", "已完成" }, { "Abort", "中止" }, { "Accept", "接受" }, { "Decline", "拒绝" },
-    { "Allow", "允许" }, { "Deny", "拒绝" }, { "Request", "请求" }, { "Respond", "回应" },
-    { "Reply", "回复" }, { "Mute", "静音" }, { "Unmute", "取消静音" }, { "Report", "举报" },
-    { "Mark", "标记" }, { "Track", "追踪" }, { "Scan", "扫描" }, { "Sync", "同步" },
-    { "Verify", "验证" }, { "Check", "检查" }, { "Test", "测试" }, { "Try", "尝试" },
-    { "Train", "训练" }, { "Summon", "召唤" }, { "Cast", "施放" }, { "Charge", "蓄力" },
-    { "Shoot", "射击" }, { "Fire", "开火" }, { "Reload", "重装" }, { "Throw", "投掷" },
-    { "Place", "放置" }, { "Build", "建造" }, { "Destroy", "摧毁" }, { "Break", "破坏" },
-    { "Defend", "防御" }, { "Heal", "治疗" }, { "Protect", "保护" }, { "Avoid", "躲避" },
-    { "Skip", "跳过" }, { "Skipped", "已跳过" }, { "Wait", "等待" }, { "Waiting", "等待中" },
-    { "Return", "返回" }, { "Go", "前往" }, { "Move", "移动" }, { "Stay", "停留" },
-    { "Enter", "进入" }, { "Leave", "离开" }, { "Join", "加入" },
-    { "Buy", "购买" }, { "Sell", "出售" }, { "Open", "打开" }, { "Close", "关闭" },
-    { "Show", "显示" }, { "Hide", "隐藏" }, { "Lower", "降低" }, { "Raise", "提高" },
-    { "Sound", "声音" }, { "Sounds", "声音" }, { "Music", "音乐" }, { "Volume", "音量" },
-    { "Particle", "粒子" }, { "Particles", "粒子" }, { "Door", "门" }, { "Doors", "门" },
-    { "Static", "静态" }, { "Exploiter", "作弊者" }, { "Exploiters", "作弊者" },
-    { "Common", "普通" }, { "Uncommon", "罕见" }, { "Rare", "稀有" }, { "Mythic", "神话" },
-    { "Divine", "神圣" }, { "Unique", "独特" }, { "Special", "特殊" },
-    { "Nothing here", "这里什么都没有" },
-    { "Hover on desktop or hold on mobile to reveal quick info", "桌面端悬停、移动端长按可查看快速信息" },
-
-    -- 通用菜单高频词（来自未调优菜单的实测缺口）
-    { "New", "新建" }, { "Shake", "震动" }, { "Mouse", "鼠标" }, { "Crosshair", "准星" },
-    { "Accent", "强调" }, { "Duplicate", "复制" }, { "Clipboard", "剪贴板" }, { "View", "查看" },
-    { "Bug", "问题" }, { "Unload", "卸载" }, { "Hop", "跳转" }, { "Base", "基地" },
-    { "Anchor", "锚定" }, { "Ghost", "幽灵" }, { "Gravity", "重力" }, { "Release", "释放" },
-    { "Kill", "击杀" }, { "Dead", "死亡" }, { "Dismiss", "关闭" }, { "Streamer", "主播" },
-    { "Timeout", "超时" }, { "Count", "数量" }, { "Verbose", "详细" }, { "Logging", "日志" },
-    { "Frame", "帧" }, { "Camera", "镜头" }, { "Style", "样式" }, { "Rich Presence", "在线状态" },
-    { "Report a Bug", "报告问题" }, { "Request a Feature", "请求新功能" },
-    { "Create New Config", "新建配置" }, { "Duplicate Config", "复制配置" },
-    { "Master Volume", "主音量" }, { "Spawn Item", "生成物品" },
-    { "Blacklist Player", "拉黑玩家" }, { "Ignore Dead", "忽略已死亡" },
-    { "Cheater", "作弊者" }, { "Cheaters", "作弊者" }, { "Hacker", "黑客" },
-    { "Hackers", "黑客" }, { "Alt", "小号" }, { "Alts", "小号" },
-
-    -- 名词 / 对象
-    { "Effect", "效果" }, { "Effects", "效果" }, { "Aura", "光环" }, { "Rune", "符文" },
-    { "Runes", "符文" }, { "Ore", "矿石" }, { "Wood", "木材" }, { "Stone", "石头" },
-    { "Food", "食物" }, { "Water", "水" }, { "Seed", "种子" }, { "Seeds", "种子" },
-    { "Crop", "作物" }, { "Crops", "作物" }, { "Pet", "宠物" }, { "Pets", "宠物" },
-    { "Mount", "坐骑" }, { "Egg", "蛋" }, { "Eggs", "蛋" }, { "Hatch", "孵化" },
-    { "Skin", "皮肤" }, { "Skins", "皮肤" }, { "Cosmetic", "装饰" }, { "Cosmetics", "装饰" },
-    { "Emote", "表情" }, { "Badge", "徽章" }, { "Title", "称号" }, { "Titles", "称号" },
-    { "Tag", "标签" }, { "Chest", "宝箱" }, { "Crate", "箱子" }, { "Crates", "箱子" },
-    { "Loot", "战利品" }, { "Drop", "掉落" }, { "Drops", "掉落" }, { "Spawner", "刷新点" },
-    { "Portal", "传送门" }, { "Island", "岛屿" }, { "Cave", "洞穴" }, { "Forest", "森林" },
-    { "Desert", "沙漠" }, { "Snow", "雪原" }, { "Ocean", "海洋" }, { "Beach", "海滩" },
-    { "Mountain", "山脉" }, { "Village", "村庄" }, { "City", "城市" }, { "Castle", "城堡" },
-    { "Monster", "怪物" }, { "Monsters", "怪物" }, { "Mobs", "怪物" }, { "Mob", "怪物" },
-    { "Ally", "盟友" }, { "Allies", "盟友" }, { "NPC", "NPC" }, { "Rebirth", "重生" },
-    { "Prestige", "转生" }, { "Ascend", "飞升" }, { "Evolve", "进化" }, { "Evolution", "进化" },
-    { "Mutation", "变异" }, { "Fusion", "融合" }, { "Recipe", "配方" }, { "Blueprint", "图纸" },
-    { "Material", "材料" }, { "Materials", "材料" }, { "Rod", "钓竿" }, { "Stash", "仓库" },
-    { "Vault", "金库" }, { "Wardrobe", "衣柜" }, { "Outfit", "套装" }, { "Gear", "装备" },
-    { "Accessory", "饰品" }, { "Consumable", "消耗品" }, { "Potion", "药水" },
-    { "Owned", "拥有" }, { "Owns", "拥有" }, { "Unveil", "揭示" }, { "Unveils", "揭示" },
-    { "Automatically", "自动" }, { "Manual", "手动" }, { "Points", "积分" },
-
-    -- 界面控件
-    { "Dashboard", "控制面板" }, { "Panel", "面板" }, { "Window", "窗口" }, { "Tab", "标签页" },
-    { "Tabs", "标签页" }, { "Section", "栏目" }, { "Sections", "栏目" }, { "Group", "分组" },
-    { "Groups", "分组" }, { "Category", "分类" }, { "Categories", "分类" }, { "Submenu", "子菜单" },
-    { "Slider", "滑块" }, { "Checkbox", "复选框" }, { "Dropdown", "下拉框" }, { "Input", "输入框" },
-    { "Label", "标签" }, { "Text", "文本" }, { "Description", "说明" }, { "Tooltip", "提示" },
-    { "Preview", "预览" }, { "Layout", "布局" }, { "Position", "位置" }, { "Alignment", "对齐" },
-    { "Opacity", "不透明度" }, { "Transparency", "透明度" }, { "Color", "颜色" },
-    { "Colors", "颜色" }, { "Font", "字体" }, { "Icon", "图标" }, { "Icons", "图标" },
-    { "Minimize", "最小化" }, { "Maximize", "最大化" }, { "Prefix", "前缀" },
-    { "Suffix", "后缀" }, { "Command", "指令" }, { "Commands", "指令" }, { "Help", "帮助" },
-    { "Support", "支持" }, { "Documentation", "文档" }, { "Tutorial", "教程" },
-    { "Guide", "指南" }, { "FAQ", "常见问题" }, { "Terms", "条款" }, { "Privacy", "隐私" },
-    { "License", "许可" }, { "Account", "账号" }, { "Login", "登录" }, { "Logout", "登出" },
-    { "Register", "注册" }, { "Subscription", "订阅" }, { "Checkout", "结算" },
-    { "Balance", "余额" }, { "Receive", "接收" }, { "Receive Only", "仅接收" },
-    { "Send Only", "仅发送" }, { "Hide UI", "隐藏界面" }, { "Show UI", "显示界面" },
-    { "Toggle Key", "开关按键" }, { "Binds", "绑定" }, { "Reset Key", "重置按键" },
-    { "Default Key", "默认按键" },
-
-    -- 方位 / 相对
-    { "Left", "左侧" }, { "Right", "右侧" }, { "Up", "上" }, { "Down", "下" },
-    { "Top", "顶部" }, { "Bottom", "底部" }, { "Center", "中心" }, { "Middle", "中间" },
-    { "Front", "前方" }, { "Behind", "后方" }, { "Inside", "内部" }, { "Outside", "外部" },
-    { "Nearby", "附近" }, { "Around", "周围" }, { "Under", "下方" }, { "Near", "近" },
-    { "Far", "远" },
-
-    -- 时间 / 频率
-    { "Second", "秒" }, { "Minute", "分钟" }, { "Hour", "小时" }, { "Day", "天" },
-    { "Week", "周" }, { "Month", "月" }, { "Year", "年" }, { "Today", "今天" },
-    { "Tomorrow", "明天" }, { "Yesterday", "昨天" }, { "Morning", "早晨" },
-    { "Evening", "晚间" }, { "Night", "夜晚" }, { "Every", "每" }, { "Per", "每" },
-    { "Hourly", "每小时" }, { "Daily Reward", "每日奖励" }, { "Weekly Reward", "每周奖励" },
-
-    -- 数量 / 修饰
-    { "More", "更多" }, { "Less", "更少" }, { "Many", "许多" }, { "Some", "一些" },
-    { "Each", "每个" }, { "Both", "两者" }, { "Most", "最多" }, { "Least", "最少" },
-    { "Equal", "相等" }, { "Same", "相同" }, { "Different", "不同" }, { "Other", "其他" },
-    { "Another", "另一个" }, { "Only", "仅" }, { "Also", "同时" }, { "Still", "仍然" },
-    { "Sometimes", "有时" }, { "Usually", "通常" }, { "Rarely", "很少" }, { "Mostly", "大多" },
-
-    -- 功能 / 反作弊
-    { "Magic Bullet", "魔法子弹" }, { "Hitbox Expander", "判定框扩大" },
-    { "Stream Proof", "防录制" }, { "Screenshot Proof", "防截图" }, { "Desync", "不同步" },
-    { "Speed Hack", "加速" }, { "Fly Hack", "飞行" }, { "Anti-Gravity", "反重力" },
-    { "Freeze", "冻结" }, { "Float", "漂浮" }, { "Spin", "旋转" }, { "Anti Report", "防举报" },
-    { "Anti Crash", "防崩溃" }, { "Detector", "检测器" }, { "Detection", "检测" },
-    { "Spectate", "观战" }, { "Executor", "执行器" }, { "Injector", "注入器" },
-    { "Build Number", "版本号" }, { "Anti Stun", "防眩晕" }, { "Anti Ragdoll", "防布娃娃" },
-
-    -- 常用整句 / 提示
-    { "Reconnect Now", "立即重连" }, { "Reconnect", "重连" }, { "Rejoin on Disconnect", "断线时重进" },
-    { "No charms to equip", "没有可装备的护符" }, { "No items to show", "没有可显示物品" },
-    { "No data available", "暂无数据" }, { "No friends online", "没有在线好友" },
-    { "No players found", "未找到玩家" }, { "No active feature", "暂无激活功能" },
-    { "In use", "使用中" }, { "Not in use", "未使用" }, { "Not equipped", "未装备" },
-    { "Not selected", "未选中" }, { "Not owned", "未拥有" }, { "Not unlocked", "未解锁" },
-    { "Tap to open", "点击打开" }, { "Hold to open", "长按打开" }, { "Press to open", "按键打开" },
-    { "Click to bind", "点击绑定" }, { "Press any key", "按任意键" }, { "Press the key", "按键绑定" },
-    { "Right click to reset", "右键重置" }, { "Copied to clipboard", "已复制到剪贴板" },
-    { "Saved successfully", "保存成功" }, { "Copied successfully", "复制成功" },
-    { "Failed to load", "加载失败" }, { "Failed to save", "保存失败" },
-    { "Are you sure", "确定吗" }, { "Please wait", "请稍候" }, { "This action cannot be undone", "此操作不可撤销" },
-    { "Parries attacks right before they land; Spear and Dual Blades have no parry", "在攻击命中前格挡；长矛与双刃无法格挡" },
-    { "Are you sure you want to continue", "确定要继续吗" },
-    { "Use potion when below 30% HP", "生命低于 30% 时使用药水" },
-    { "Fly to Waypoint", "飞行到传送点" }, { "Teleport to Player", "传送到玩家" },
-    { "Teleport to Waypoint", "传送到传送点" }, { "Save Config for Next Session", "保存配置供下次使用" },
-    { "Anti-Aim", "反自瞄" }, { "Anti-Aim Mode", "反自瞄模式" },
-    { "Min Health to Heal", "治疗所需最低生命" }, { "Aim Smoothing Amount", "瞄准平滑幅度" },
-    { "Auto Sell When Full", "背包满时自动出售" }, { "Unlock All Doors", "解锁所有门" },
-    { "Click or press Delete to open", "点击或按 Delete 打开" },
-
-    -- 专有名词直通（保证不会因为未翻译而整句被拒）
-    { "Morvik", "Morvik" }, { "Roblox", "Roblox" }, { "Robux", "Robux" },
-    { "Ancient Sands", "远古沙海" }, { "Super Charm", "超级护符" },
-    { "Super Charm [Epic]", "超级护符 [史诗]" },
+    -- 专有名词直通（保证不会因为"没翻"而整句被拒）
+    { "Roblox", "Roblox" }, { "Robux", "Robux" }, { "Discord", "Discord" },
 }
 
 ----------------------------------------------------------------
@@ -1004,25 +710,281 @@ end
 -- 结果缓存：菜单里同一串文字会反复出现
 clearCache = function() CACHE, CACHE_N = {}, 0 end
 
+----------------------------------------------------------------
+-- 4.5 自动翻译引擎
+----------------------------------------------------------------
+-- 词表翻不出来的文本，先入队，再由 worker 协程调用在线翻译接口，
+-- 结果写进 AUTO.cache 并触发重扫，界面上就会即时变成中文。
+-- 设计要点：
+--   · 词表优先（本地、零延迟、稳定），只在词表没覆盖时才走网络
+--   · 后端自动探测：google -> mymemory -> youdao，哪个通用哪个
+--   · 玩家名 / 标识符 / 长句 / 含中文的串 一律不入队，避免翻出一堆乱码
+--   · 全程 pcall 兜底，网络挂了就静默退回纯词表模式，不影响原功能
+local AUTO = {
+    cache     = {},   -- [英文原文] = 中文
+    pending   = {},   -- [英文原文] = true 已入队
+    queue     = {},   -- 待翻队列
+    provider  = nil,  -- 探测出的可用后端
+    enabled   = false,
+    started   = false,
+    okCount   = 0,
+    failCount = 0,
+    skipNames = {},
+    onTranslated = nil,
+}
+
+-- JSON 字符串反转义（\uXXXX 中文 / \" / \n / \\）
+local function jsonUnescape(s)
+    if not s:find("\\", 1, true) then return s end
+    s = s:gsub("\\u(%x%x%x%x)", function(h)
+        local cp = tonumber(h, 16)
+        if cp < 0x80 then return string.char(cp) end
+        if cp < 0x800 then
+            return string.char(0xC0 + math.floor(cp / 0x40), 0x80 + cp % 0x40)
+        end
+        return string.char(
+            0xE0 + math.floor(cp / 0x1000),
+            0x80 + math.floor((cp % 0x1000) / 0x40),
+            0x80 + cp % 0x40)
+    end)
+    s = s:gsub("\\n", "\n"):gsub("\\t", "\t"):gsub('\\"', '"'):gsub("\\/", "/")
+    return s
+end
+
+local function urlEncode(s)
+    return (tostring(s):gsub("[^%w%-%._~]", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end))
+end
+
+local function httpGet(url)
+    local fn = ENV.request or ENV.http_request
+    if type(fn) ~= "function" and type(ENV.http) == "table" then
+        fn = ENV.http.request
+    end
+    if type(fn) ~= "function" then return nil end
+    local ok, res = pcall(fn, {
+        Url = url,
+        Method = "GET",
+        Headers = { ["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+        Timeout = CONFIG.apiTimeoutMs,
+    })
+    if not ok or type(res) ~= "table" then return nil end
+    local code = tonumber(res.StatusCode or res.status)
+    if code and code ~= 200 then return nil end
+    local body = res.Body or res.body
+    if type(body) ~= "string" or body == "" then return nil end
+    return body
+end
+
+local PROVIDERS = {
+    -- 响应最短最干净：[[["竞赛模式","Race Mode",...],...],null,"en",...]
+    google = function(text)
+        local body = httpGet("https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t&q=" .. urlEncode(text))
+        if not body then return nil end
+        local segs = {}
+        for tgt, src in body:gmatch('%["([^"]*)"%s*,%s*"([^"]*)"') do
+            -- 结尾会跟一个 ["<32位hash>","en_zh_xxx.md"] 的元数据对，排除掉
+            if not tgt:match("^%x+$") and src ~= "" then
+                segs[#segs + 1] = jsonUnescape(tgt)
+            end
+        end
+        if #segs == 0 then return nil end
+        return table.concat(segs)
+    end,
+
+    -- 免 key，返回 {"responseData":{"translatedText":"\u6bd4\u8d5b\u6a21\u5f0f"}}
+    mymemory = function(text)
+        local body = httpGet("https://api.mymemory.translated.net/get?q=" .. urlEncode(text) .. "&langpair=en%7Czh-CN")
+        if not body then return nil end
+        local tgt = body:match('"translatedText"%s*:%s*"([^"]*)"')
+        if not tgt or tgt == "" then return nil end
+        return jsonUnescape(tgt)
+    end,
+
+    -- 有道词典接口，中文质量好但带 <b> 标签要洗掉
+    youdao = function(text)
+        local body = httpGet("https://dict.youdao.com/jsonapi?q=" .. urlEncode(text))
+        if not body then return nil end
+        local tgt = body:match('"summary"%s*:%s*%{"line"%s*:%s*%[%s*"([^"]*)"')
+        if not tgt then
+            tgt = body:match('"trs"%s*:%s*%[%s*%{"tr"%s*:%s*%[%s*%{"l"%s*:%s*%{"i"%s*:%s*%[%s*"([^"]*)"')
+        end
+        if not tgt then return nil end
+        tgt = jsonUnescape(tgt):gsub("<b>", ""):gsub("</b>", ""):gsub("<[^>]->", "")
+        return tgt
+    end,
+}
+
+-- 判断一段文本值不值得送去机翻
+local function worthTranslate(s)
+    if type(s) ~= "string" then return false end
+    local n = #s
+    if n < 2 or n > CONFIG.maxTextLen then return false end
+    if s:find("[\228-\233]") then return false end            -- 已含中文
+    if s:find("http", 1, true) or s:find("www.", 1, true) then return false end
+    local letters = 0
+    for _ in s:gmatch("%a") do letters += 1 end
+    if letters < 2 then return false end                      -- 数字/符号为主
+    -- 标识符样式：无空格且含 2 个以上大写（RiverbendCanyon / BackseatRally）→ 专有名词，别翻
+    local _, upper = s:gsub("[^%u]", "")
+    if not s:find("%s") and upper >= 2 then return false end
+    if CONFIG.skipPlayerNames and AUTO.skipNames[s] then return false end
+    return true
+end
+
+function AUTO.enqueue(s)
+    if not AUTO.enabled then return false end
+    if AUTO.cache[s] or AUTO.pending[s] then return false end
+    if #AUTO.queue >= CONFIG.maxQueue then return false end
+    if not worthTranslate(s) then return false end
+    AUTO.pending[s] = true
+    AUTO.queue[#AUTO.queue + 1] = s
+    return true
+end
+
+local function pickProvider()
+    if AUTO.provider then return AUTO.provider end
+    local want = CONFIG.apiProvider
+    if want and want ~= "auto" and PROVIDERS[want] then
+        AUTO.provider = want
+        return want
+    end
+    for _, name in ipairs({ "google", "mymemory", "youdao" }) do
+        local ok, r = pcall(PROVIDERS[name], "Drive")
+        if ok and type(r) == "string" and r ~= "" and r:find("[\228-\233]") then
+            AUTO.provider = name
+            return name
+        end
+    end
+    return nil
+end
+
+local function workerLoop()
+    local provider = pickProvider()
+    if not provider then
+        AUTO.enabled = false
+        if CONFIG.verbose then
+            warn("[UIT-CN] 自动翻译不可用（翻译接口全部请求失败），已退回纯词表模式")
+        end
+        return
+    end
+    if CONFIG.verbose then
+        print("[UIT-CN] 自动翻译已启用，后端: " .. provider)
+    end
+
+    while AUTO.enabled do
+        local n = #AUTO.queue
+        if n == 0 then
+            task.wait(0.4)
+        else
+            local batch = {}
+            for i = 1, math.min(CONFIG.apiBatch, n) do
+                batch[i] = table.remove(AUTO.queue, 1)
+            end
+
+            local done, total = 0, #batch
+            for _, src in ipairs(batch) do
+                task.spawn(function()
+                    local tgt = nil
+                    for _ = 0, CONFIG.apiRetries do
+                        local ok, r = pcall(PROVIDERS[provider], src)
+                        if ok and type(r) == "string" and r ~= "" then
+                            tgt = r
+                            break
+                        end
+                        task.wait(0.3)
+                    end
+                    if tgt and tgt ~= "" and tgt:lower() ~= src:lower() then
+                        AUTO.cache[src] = tgt
+                        CACHE[src] = nil          -- 清掉「翻不出」的负缓存，让 translate 重算
+                        AUTO.okCount += 1
+                    else
+                        AUTO.failCount += 1
+                    end
+                    AUTO.pending[src] = nil
+                    done += 1
+                end)
+            end
+
+            local t0 = os.clock()
+            while done < total and (os.clock() - t0) < 20 do
+                task.wait(0.05)
+            end
+            if AUTO.onTranslated then pcall(AUTO.onTranslated) end
+            task.wait(CONFIG.apiInterval)
+        end
+    end
+end
+
+function AUTO.start()
+    if AUTO.started then return end
+    AUTO.started = true
+    AUTO.enabled = (CONFIG.autoTranslate == true)
+    if not AUTO.enabled then return end
+    -- 收集玩家名，这些人名不该被翻
+    pcall(function()
+        for _, pl in ipairs(PlayersSvc:GetPlayers()) do
+            AUTO.skipNames[pl.Name] = true
+            AUTO.skipNames[pl.DisplayName] = true
+        end
+        PlayersSvc.PlayerAdded:Connect(function(pl)
+            pcall(function()
+                AUTO.skipNames[pl.Name] = true
+                AUTO.skipNames[pl.DisplayName] = true
+            end)
+        end)
+    end)
+    task.spawn(workerLoop)
+end
+
+function AUTO.stats()
+    local cached = 0
+    for _ in pairs(AUTO.cache) do cached += 1 end
+    return {
+        provider = AUTO.provider or "none",
+        enabled  = AUTO.enabled,
+        cached   = cached,
+        queue    = #AUTO.queue,
+        ok       = AUTO.okCount,
+        fail     = AUTO.failCount,
+    }
+end
+
 local function translate(s)
     if type(s) ~= "string" or s == "" then return nil end
     if not s:find("[%a]") then return nil end            -- 纯数字/符号
     if s:find("[\228-\233]") then return nil end          -- 已含中文
     if s:find("http", 1, true) or s:find("www.", 1, true) then return nil end
+
+    -- 1) 词表正缓存：命中就返回。词表永远是第一优先级，
+    --    否则机翻的烂译法（Auto→汽车）一旦进缓存，加词条也盖不住。
     local cached = CACHE[s]
-    if cached ~= nil then return cached or nil end
-    local out, changed = {}, false
-    for line in (s .. "\n"):gmatch("([^\n]*)\n") do
-        local r, ch = translateSegment(line)
-        out[#out + 1] = r
-        changed = changed or ch
-    end
+    if cached then return cached end
+
+    -- 2) 词表翻译。cached == false 表示"算过但翻不出"，不用重复计算
     local res = nil
-    if changed then res = table.concat(out, "\n") end
-    if CACHE_N > 4000 then clearCache() end
-    CACHE[s] = res or false
-    CACHE_N += 1
-    return res
+    if cached == nil then
+        local out, changed = {}, false
+        for line in (s .. "\n"):gmatch("([^\n]*)\n") do
+            local r, ch = translateSegment(line)
+            out[#out + 1] = r
+            changed = changed or ch
+        end
+        if changed then res = table.concat(out, "\n") end
+        if CACHE_N > 4000 then clearCache() end
+        CACHE[s] = res or false
+        CACHE_N += 1
+        if res then return res end
+    end
+
+    -- 3) 词表翻不出 -> 用机翻结果兜底
+    local ai = AUTO.cache[s]
+    if ai then return ai end
+
+    -- 4) 两边都没有 -> 排队（enqueue 内部幂等，重复调用不会重复入队）
+    if AUTO.enabled then AUTO.enqueue(s) end
+    return nil
 end
 
 ----------------------------------------------------------------
@@ -1153,17 +1115,30 @@ local BUILTIN = {
 }
 
 -- 菜单特征词：用来判断一个 GUI 是不是脚本菜单
+-- 注意：这份表是「打分用」的，词越贴近真实菜单越准。
+--       早期版本只有 FPS 外挂词（aimbot/esp/noclip/fly），导致赛车、模拟、经营、
+--       抽卡类脚本一个词都命中不到，于是整块被判定为「不是菜单」而跳过。
+--       下面按领域分组补齐，仍然只用有辨识度的词，不放 on/off/yes/no 这类超短词。
 local MARKERS = {
-    toggle = true, enabled = true, disabled = true, auto = true, esp = true,
-    aimbot = true, speed = true, keybind = true, settings = true, config = true,
-    player = true, players = true, teleport = true, farm = true, fps = true,
-    ping = true, slot = true, amount = true, distance = true, radius = true,
-    aim = true, silent = true, fly = true, noclip = true, godmode = true,
-    delay = true, weapon = true, weapons = true, damage = true, health = true,
-    team = true, enemy = true, target = true, notification = true, script = true,
-    hub = true, feature = true, features = true, misc = true, visual = true,
-    press = true, click = true, hold = true, value = true, range = true,
-    luck = true, cooldown = true, upgrade = true, shop = true, quest = true,
+    -- 判定用打分表：只要命中 1 个就算菜单（CONFIG.minMenuScore = 1）。
+    -- 分组覆盖：面板结构 / 外挂通用 / 赛车驾驶 / 经济进度 / 玩法商店 / 设置控件。
+    toggle=1, enabled=1, disabled=1, auto=1, settings=1, config=1, option=1, options=1,
+    menu=1, panel=1, window=1, tab=1, button=1, label=1, title=1, header=1, status=1,
+    system=1, check=1, mode=1, selected=1, current=1, map=1, stage=1,
+    start=1, stop=1, pause=1, paused=1, resume=1, restart=1, exit=1, close=1, open=1,
+    enable=1, disable=1, apply=1, save=1, load=1, reset=1, default=1, custom=1,
+    esp=1, aimbot=1, aim=1, silent=1, fly=1, noclip=1, godmode=1, speed=1, keybind=1,
+    hotkey=1, teleport=1, farm=1, fps=1, ping=1, hub=1, script=1, feature=1, features=1,
+    player=1, players=1, team=1, enemy=1, target=1, damage=1, health=1, weapon=1,
+    race=1, racing=1, rally=1, car=1, cars=1, vehicle=1, drive=1, driver=1, drift=1,
+    lap=1, track=1, gear=1, engine=1, nitro=1, boost=1, checkpoint=1, finish=1, garage=1,
+    credit=1, credits=1, earning=1, earnings=1, coin=1, coins=1, cash=1, money=1,
+    gem=1, gems=1, token=1, reward=1, rewards=1, balance=1, price=1, cost=1, total=1,
+    level=1, lvl=1, rank=1, exp=1, xp=1, progress=1, unlock=1, claim=1, collect=1, streak=1,
+    shop=1, store=1, market=1, inventory=1, backpack=1, item=1, items=1, buy=1, sell=1,
+    purchase=1, crate=1, chest=1, upgrade=1, quest=1, mission=1, challenge=1, loot=1,
+    amount=1, value=1, interval=1, delay=1, distance=1, radius=1, range=1, buffer=1,
+    slider=1, checkbox=1, dropdown=1, input=1, threshold=1, smoothing=1, prediction=1,
 }
 
 local guiCache = setmetatable({}, { __mode = "k" })  -- [gui] = { ok = bool, t = clock }
@@ -1212,6 +1187,9 @@ local function nameIncluded(name)
     for _, pat in ipairs(CONFIG.includeNames) do
         if n:find(pat:lower(), 1, true) then return true end
     end
+    for _, pat in ipairs(CONFIG.forceInclude or {}) do
+        if n:find(pat:lower(), 1, true) then return true end
+    end
     return false
 end
 
@@ -1231,8 +1209,10 @@ local function isTarget(gui, strict)
         if nameExcluded(name) then return false end
         if gui:GetAttribute("UIT_SELF") then return false end
 
+        -- 强制纳入（includeNames / forceInclude）：不再参与打分，直接翻
+        if nameIncluded(name) then return true end
+
         local tc, sc = analyze(gui)
-        if nameIncluded(name) and tc >= 3 then return true end
         if tc < CONFIG.minTextsForMenu then return false end
         if strict then return sc >= CONFIG.minMenuScore end
         if tc >= CONFIG.bigTextsForMenu then return true end
@@ -1279,6 +1259,23 @@ local function targetAncestor(o, strict)
             if cn == "ScreenGui" then
                 if isTarget(p, strict) then return p end
             elseif cn == "BillboardGui" or cn == "SurfaceGui" then
+                -- 3D 世界标签默认不碰（满地图广告牌会被翻乱）
+                -- CONFIG.includeBillboard = true 时放开：文本量小，不参与打分，有字就认
+                if CONFIG.includeBillboard then
+                    if nameIncluded(p.Name) then
+                        guiCache[p] = { ok = true, t = os.clock() }
+                        targetCount += 1
+                        state.guis = targetCount
+                        return p
+                    end
+                    local tc = select(1, analyze(p))
+                    if tc >= 1 then
+                        guiCache[p] = { ok = true, t = os.clock() }
+                        targetCount += 1
+                        state.guis = targetCount
+                        return p
+                    end
+                end
                 return nil
             elseif nameIncluded(p.Name) then
                 guiCache[p] = { ok = true, t = os.clock() }
@@ -1529,6 +1526,19 @@ end
 local function start()
     buildToggle()
 
+    -- 0) 必须先启动自动翻译，再扫描。
+    --    反过来的话，第一轮扫描时 AUTO 还没就绪，识别不出的文本会被写成负缓存，
+    --    等机翻起来后 translate() 在负缓存处直接返回 nil，那条文本永远翻不到。
+    if CONFIG.autoTranslate then
+        AUTO.onTranslated = function()
+            -- 队列消化得差不多了才重扫，避免每翻一条就整屏重扫
+            if state.enabled and state.running and #AUTO.queue < 4 then
+                pcall(sweepAll, state.usePlayerGui, state.usePlayerGui)
+            end
+        end
+        AUTO.start()
+    end
+
     -- 1) 先扫隐藏容器（gethui / CoreGui）
     local ok1, r1 = pcall(sweepAll, false)
     if not ok1 and CONFIG.verbose then
@@ -1613,8 +1623,112 @@ api.rescan = function()
 end
 api.stats = function() return state.count, countTargets(), state.enabled end
 api.parent = function() return GUI_PARENT_NAME end
+
+--- 开关自动翻译
+---   用法：getgenv().UIT_CN.auto(false)  关闭（只走词表）
+---         getgenv().UIT_CN.auto(true)   打开
+api.auto = function(on)
+    CONFIG.autoTranslate = (on ~= false)
+    if CONFIG.autoTranslate then
+        if not AUTO.started then AUTO.start() else AUTO.enabled = true end
+    else
+        AUTO.enabled = false
+    end
+    return CONFIG.autoTranslate
+end
+
+--- 自动翻译状态：后端 / 已缓存条数 / 待翻队列 / 成功失败计数
+api.autoStats = function() return AUTO.stats() end
+
+--- 手动指定翻译后端：auto | google | mymemory | youdao
+api.setProvider = function(name)
+    if name == "auto" or PROVIDERS[name] then
+        AUTO.provider = nil
+        CONFIG.apiProvider = name
+        return true
+    end
+    return false
+end
+
+--- 清空自动翻译缓存（换了后端或想重翻时用）
+api.clearAutoCache = function()
+    AUTO.cache, AUTO.pending, AUTO.queue = {}, {}, {}
+    clearCache()
+    return true
+end
+
+--- 诊断：列出每个界面的文本量 / 菜单分 / 判定结果 / 被卡在哪一条
+--- 用法：getgenv().UIT_CN.diagnose()        只看汇总
+---       getgenv().UIT_CN.diagnose(true)    连同实际英文文本一起打印
+api.diagnose = function(showTexts)
+    local T = { TextLabel = true, TextButton = true, TextBox = true }
+    local total, okCnt = 0, 0
+
+    print("[UIT-CN 诊断] 当前阈值：文本数 >= " .. CONFIG.minTextsForMenu
+        .. " ｜ 菜单分 >= " .. CONFIG.minMenuScore
+        .. " ｜ translatePlayerGui = " .. tostring(CONFIG.translatePlayerGui)
+        .. " ｜ includeBillboard = " .. tostring(CONFIG.includeBillboard))
+
+    local list = containerList(true)   -- 含 PlayerGui，看清全貌
+    for _, c in ipairs(list) do
+        local ok, kids = pcall(function() return c:GetChildren() end)
+        if ok then
+            for _, gui in ipairs(kids) do
+                local cn = gui.ClassName
+                if cn == "ScreenGui" or cn == "BillboardGui" or cn == "SurfaceGui" then
+                    local tc, sc = analyze(gui)
+                    if tc > 0 then
+                        total += 1
+                        local will, reason = false, "?"
+                        if nameExcluded(gui.Name) then
+                            reason = "内置黑名单"
+                        elseif nameIncluded(gui.Name) then
+                            will, reason = true, "强制纳入"
+                        elseif cn == "BillboardGui" or cn == "SurfaceGui" then
+                            if CONFIG.includeBillboard then
+                                will, reason = true, "3D 标签已开启"
+                            else
+                                reason = "3D 标签未开启"
+                            end
+                        elseif tc < CONFIG.minTextsForMenu then
+                            reason = "文本数 " .. tc .. " < " .. CONFIG.minTextsForMenu
+                        elseif sc < CONFIG.minMenuScore then
+                            reason = "菜单分 " .. sc .. " < " .. CONFIG.minMenuScore
+                        else
+                            will, reason = true, "打分通过"
+                        end
+                        if will then okCnt += 1 end
+                        print(string.format("  %s %-24s [%s] 文本=%-3d 分=%-2d %s",
+                            will and "[√]" or "[×]", tostring(gui.Name):sub(1, 24), cn, tc, sc, reason))
+                        if showTexts then
+                            local n = 0
+                            for _, d in ipairs(gui:GetDescendants()) do
+                                if T[d.ClassName] then
+                                    local t = d.Text
+                                    if type(t) == "string" and #t > 0 and t:match("%a") then
+                                        n += 1
+                                        if n <= 15 then
+                                            print("        · " .. t:gsub("\n", "\\n"):sub(1, 68))
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    print(("[UIT-CN 诊断] 有文字的界面共 %d 个，会被翻译 %d 个"):format(total, okCnt))
+    if okCnt == 0 and total > 0 then
+        print("[UIT-CN 诊断] 一个都没通过？把目标 GUI 名字填进 CONFIG.forceInclude = { \"名字片段\" } 即可必翻")
+    end
+    return okCnt, total
+end
 api.stop = function()
     state.running = false
+    AUTO.enabled = false          -- 停掉自动翻译 worker
     for _, c in ipairs(state.conns) do pcall(function() c:Disconnect() end) end
     state.conns = {}
     newQueue, flushQueued = {}, false
